@@ -1,0 +1,6 @@
+.DS_Store
+/build*/
+
+# Local planning and agent-session instructions; keep outside public commits.
+/docs/why.md
+/AGENTS.md

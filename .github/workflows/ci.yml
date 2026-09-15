@@ -1,0 +1,23 @@
+name: C build and tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        compiler: [gcc, clang]
+        exclude:
+          - os: macos-latest
+            compiler: gcc
+    runs-on: ${{ matrix.os }}
+    env:
+      CC: ${{ matrix.compiler }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p build/tmp
+      - run: echo "TMPDIR=$GITHUB_WORKSPACE/build/tmp" >> "$GITHUB_ENV"
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DWHY_SANITIZE=ON
+      - run: cmake --build build --parallel
+      - run: ctest --test-dir build --output-on-failure
