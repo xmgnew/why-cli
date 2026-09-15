@@ -87,9 +87,3 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) for build, test, and review conventions.
 The [implementation guide](docs/implementation.md) describes module ownership,
 resource limits, current validation, and remaining work. The detailed
 [v0.1 design specification](docs/v0.1-spec.md) is currently written in Chinese.
-
-## License
-
-No license has been selected yet. A `LICENSE` file will be added once the
-maintainer chooses the project's license. External code contributions are not
-being accepted until that choice is made; feedback and issue reports are welcome.
