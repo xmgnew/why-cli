@@ -17,6 +17,7 @@ struct WhyHistory {
     uint64_t retention_ns;
     uint64_t last_accepted_ns;
     WhyHistoryStats stats;
+    WhyCpuDetector detector;
 };
 
 WhyHistory *why_history_create(uint64_t retention_ns, size_t budget,
@@ -170,8 +171,8 @@ static bool add_bytes(size_t *bytes, size_t more) {
     return true;
 }
 
-bool why_history_append(WhyHistory *h, const WhyFrame *frame) {
-    if (!h || !frame || frame->count > WHY_MAX_PROCESSES ||
+bool why_history_append(WhyHistory *h, const WhyFrame *frame, long hz) {
+    if (!h || !frame || hz <= 0 || frame->count > WHY_MAX_PROCESSES ||
         (frame->count && !frame->processes) ||
         frame->begin_ns > frame->end_ns ||
         (h->last_accepted_ns && frame->end_ns <= h->last_accepted_ns)) {
@@ -204,11 +205,9 @@ bool why_history_append(WhyHistory *h, const WhyFrame *frame) {
         errno = ENOSPC;
         return false;
     }
-    bool gap =
-        h->last &&
-        (why_frame_discontinuity(&h->last->frame, frame) ||
-         why_system_cpu(&h->last->frame.system, &frame->system, 1).validity !=
-             WHY_OK);
+    WhySystemInterval interval =
+        why_system_interval(h->last ? &h->last->frame : NULL, frame, hz);
+    bool gap = h->last && interval.validity != WHY_OK;
     while (h->first &&
            (h->stats.bytes > h->stats.budget - bytes ||
             frame->end_ns - h->first->frame.end_ns > h->retention_ns ||
@@ -241,6 +240,8 @@ bool why_history_append(WhyHistory *h, const WhyFrame *frame) {
     entry->sampling_gap = gap;
     entry->charged_bytes = bytes;
     lifecycle(h, entry);
+    entry->incident_completed =
+        why_detector_push(&h->detector, interval, &entry->incident);
     if (h->last)
         h->last->next = entry;
     else
@@ -276,4 +277,62 @@ const char *why_lifecycle_name(WhyLifecycleType type) {
         return "metadata changed";
     }
     return "unknown";
+}
+
+const WhyCpuDetector *why_history_detector(const WhyHistory *h) {
+    return &h->detector;
+}
+
+WhyAlignedSummary why_history_align(const WhyHistory *h, uint64_t start_ns,
+                                    uint64_t end_ns, long hz,
+                                    WhyAlignedVisitor visitor, void *context) {
+    WhyAlignedSummary result = {0};
+    if (!h->first || end_ns <= start_ns || hz <= 0) {
+        result.left_truncated = result.right_provisional = true;
+        return result;
+    }
+    const WhySystem *first = &h->first->frame.system,
+                    *last = &h->last->frame.system;
+    uint64_t first_time =
+        first->begin_ns + (first->end_ns - first->begin_ns) / 2;
+    uint64_t last_time = last->begin_ns + (last->end_ns - last->begin_ns) / 2;
+    result.left_truncated = start_ns <= first_time;
+    result.right_provisional = end_ns > last_time;
+    for (const WhyHistoryEntry *a = h->first; a && a->next; a = a->next) {
+        const WhyHistoryEntry *b = a->next;
+        if (b->frame.end_ns < start_ns || a->frame.begin_ns > end_ns)
+            continue;
+        result.partial_scan |= !a->frame.complete || !b->frame.complete ||
+                               a->tracking_dropped || b->tracking_dropped;
+        result.timing_degraded |=
+            a->frame.end_ns - a->frame.begin_ns > WHY_SECOND / 5 ||
+            b->frame.end_ns - b->frame.begin_ns > WHY_SECOND / 5;
+        for (size_t i = 0; i < a->frame.count; ++i) {
+            const WhyProcess *p = &a->frame.processes[i];
+            if (p->status == WHY_READ_OK &&
+                !why_find_process(&b->frame, p->id.pid))
+                ++result.unavailable_intervals;
+        }
+        for (size_t i = 0; i < b->frame.count; ++i) {
+            const WhyProcess *p = &b->frame.processes[i];
+            const WhyProcess *old = why_find_process(&a->frame, p->id.pid);
+            if (b->sampling_gap) {
+                ++result.unavailable_intervals;
+                continue;
+            }
+            WhyCpuOverlap portion =
+                why_cpu_overlap(old, p, hz, start_ns, end_ns);
+            if (portion.validity != WHY_OK) {
+                ++result.unavailable_intervals;
+                continue;
+            }
+            if (portion.covered_seconds > 0) {
+                result.cpu_seconds += portion.cpu_seconds;
+                ++result.portions;
+                if (visitor)
+                    visitor(p->id, portion, context);
+            }
+        }
+    }
+    return result;
 }

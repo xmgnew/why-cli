@@ -20,7 +20,8 @@ cmake --build build
 Clang. The default build does not enable sanitizers. Tests use explicit checks
 that remain active in Release builds.
 
-macOS runs the parser, calculation, metadata, ownership, and history fixtures.
+macOS runs the parser, calculation, metadata, ownership, history, spike detection
+and attribution fixtures, plus CLI argument checks.
 Linux additionally runs a live process-lifecycle test. That test needs readable
 procfs and basic POSIX shell utilities. No tests require root. Fixtures create and
 remove their files in the build working directory.
@@ -43,8 +44,10 @@ explicit types, and clear error paths over unnecessary abstraction.
 
 Keep procfs I/O separate from CPU arithmetic, history ownership, and presentation.
 Document ownership in headers. Metadata is immutable and reference counted;
-history views are borrowed until the next append or eviction. Release allocations
-on every error path, and do not change parser outputs when parsing fails.
+history views are borrowed until the next append or eviction. Attribution results
+own their row/index arrays but borrow process context: destroy the result before
+mutating or releasing its history. Release allocations on every error path, and
+do not change parser outputs when parsing fails.
 
 Treat process data as untrusted input. Check bounds, identities, counter ranges,
 read failures, and output escaping. An unavailable observation must not silently
@@ -72,3 +75,8 @@ acceptance cases as well.
 A pull request should explain the problem, resulting behavior, validation, and
 remaining limits. Do not claim that Linux behavior, hosted CI, or performance
 has been validated unless those checks were actually run.
+
+Keep user-visible behavior in `docs/usage.md`, module contracts and validation in
+`docs/implementation.md`, and milestone changes in `CHANGELOG.md`. Update the
+README status when a planned command becomes available. The detailed specification
+is a design target; distinguish implemented behavior from remaining work.

@@ -1,7 +1,7 @@
 #ifndef WHY_HISTORY_H
 #define WHY_HISTORY_H
 
-#include "why.h"
+#include "cpu_analysis.h"
 
 #define WHY_HISTORY_SECONDS 300U
 #define WHY_HISTORY_BYTES (64U * 1024U * 1024U)
@@ -27,6 +27,8 @@ typedef struct WhyHistoryEntry {
     size_t event_count;
     size_t tracking_dropped;
     bool sampling_gap;
+    bool incident_completed;
+    WhyCpuIncident incident;
     struct WhyHistoryEntry *next;
     size_t charged_bytes;
 } WhyHistoryEntry;
@@ -47,10 +49,27 @@ void why_history_destroy(WhyHistory *history);
  * times. On failure, tracker state is unchanged, but older frames may have been
  * evicted. ENOSPC means one snapshot exceeds the configured record budget.
  */
-bool why_history_append(WhyHistory *history, const WhyFrame *frame);
+bool why_history_append(WhyHistory *history, const WhyFrame *frame, long hz);
 const WhyHistoryEntry *why_history_first(const WhyHistory *history);
 const WhyHistoryEntry *why_history_latest(const WhyHistory *history);
 WhyHistoryStats why_history_stats(const WhyHistory *history);
 const char *why_lifecycle_name(WhyLifecycleType type);
+
+const WhyCpuDetector *why_history_detector(const WhyHistory *history);
+
+typedef struct {
+    double cpu_seconds;
+    size_t portions, unavailable_intervals;
+    bool left_truncated, right_provisional;
+    bool partial_scan, timing_degraded;
+} WhyAlignedSummary;
+/* Visitor receives only observed nonempty portions; no synthetic zero values.
+ * It must not mutate history. There is no allocation and no extrapolation.
+ */
+typedef void (*WhyAlignedVisitor)(WhyIdentity identity, WhyCpuOverlap portion,
+                                  void *context);
+WhyAlignedSummary why_history_align(const WhyHistory *history,
+                                    uint64_t start_ns, uint64_t end_ns, long hz,
+                                    WhyAlignedVisitor visitor, void *context);
 
 #endif

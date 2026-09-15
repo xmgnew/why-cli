@@ -139,8 +139,8 @@ static void test_collector(void) {
     CHECK(why_find_process(&next, 42)->metadata == child->metadata);
     WhyHistory *history =
         why_history_create(300 * WHY_SECOND, WHY_HISTORY_BYTES, 8);
-    CHECK(history && why_history_append(history, &frame));
-    CHECK(why_history_append(history, &next));
+    CHECK(history && why_history_append(history, &frame, 100));
+    CHECK(why_history_append(history, &next, 100));
     CHECK(why_history_latest(history)->event_count == 0);
     why_frame_destroy(&next);
     CHECK(why_history_latest(history)->frame.processes[1].metadata != NULL);

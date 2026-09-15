@@ -1,4 +1,4 @@
-#include "history.h"
+#include "attribution.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -105,6 +105,158 @@ static void display_history(const WhyHistory *history, bool timeline) {
     }
 }
 
+static void display_rank(const WhyAttribution *r, bool increment) {
+    printf("    %s (CPU seconds):\n", increment ? "Increase above own baseline"
+                                                : "Total observed activity");
+    double shown = 0;
+    for (size_t j = 0; j < r->count && j < 3; ++j) {
+        size_t i = increment ? r->increment_order[j] : j;
+        const WhyContributor *row = &r->rows[i];
+        printf("      %zu. ", j + 1);
+        if (row->context)
+            escaped(row->context->comm);
+        else
+            printf("PID %u", row->identity.pid);
+        if (row->members > 1)
+            printf(" x %zu%s", row->members,
+                   row->weak_group ? " [name-based group]" : "");
+        else
+            printf(" [%u:%" PRIu64 "]", row->identity.pid,
+                   row->identity.start_ticks);
+        printf("  total=%.3f", row->cpu_seconds);
+        if (r->end_ns > r->start_ns)
+            printf("  avg_cores=%.3f", row->cpu_seconds * (double)WHY_SECOND /
+                                           (double)(r->end_ns - r->start_ns));
+        if (!row->context_stable)
+            printf(" [context changed; kept separate]");
+        if (r->has_baseline) {
+            if (row->baseline_known)
+                printf("  increase=%.3f", row->excess_seconds);
+            else
+                printf("  increase=unknown/partial");
+        }
+        if (row->context && row->context->parent_known)
+            printf("  observed parent=%u:%" PRIu64, row->context->parent.pid,
+                   row->context->parent.start_ticks);
+        if (row->identity.pid == (uint32_t)getpid())
+            printf(" [why recorder]");
+        if (row->likely)
+            printf(" [primary observed CPU increase contributor]");
+        putchar('\n');
+        shown += row->cpu_seconds;
+    }
+    if (r->count > 3)
+        printf("      Other %zu rows: %.3f total CPU seconds\n", r->count - 3,
+               r->process_seconds - shown);
+    if (!r->count)
+        puts("      No measurable process CPU in this window.");
+}
+
+static void display_attribution(const WhyHistory *history,
+                                const WhyCpuIncident *event, long hz) {
+    WhyAttribution *r =
+        why_attribute(history, event, hz, WHY_ATTRIBUTION_CAPACITY);
+    if (!r) {
+        puts("    Contributor analysis unavailable (insufficient observations "
+             "or allocation failure).");
+        return;
+    }
+    if (event)
+        display_rank(r, true);
+    display_rank(r, false);
+    if (r->system_covered_seconds <= 0)
+        puts("    No comparable system intervals: CPU totals are unavailable, "
+             "not measured zero.");
+    else
+        printf("    Comparable retained CPU: system=%.3f, processes=%.3f, "
+               "signed residual=%.3f seconds\n",
+               r->system_seconds, r->process_seconds, r->residual_seconds);
+    if (r->system_seconds > 0)
+        printf("    Accounting ratio=%.1f%%; observed-time coverage=%.1f%%\n",
+               100 * r->accounted_ratio, 100 * r->coverage_ratio);
+    size_t unknown_rows = 0;
+    for (size_t i = 0; i < r->count; ++i)
+        if (!r->rows[i].baseline_known)
+            ++unknown_rows;
+    if (event && unknown_rows)
+        printf("    %zu rows have unknown/partial increment baselines.\n",
+               unknown_rows);
+    if (r->issues &&
+        (event || (r->issues & ~(unsigned)WHY_ATTR_UNKNOWN_BASELINE))) {
+        puts(event ? "    Primary-contributor label withheld:"
+                   : "    Ranking limitations:");
+        const struct {
+            unsigned bit;
+            const char *text;
+        } reasons[] = {
+            {WHY_ATTR_PROVISIONAL, "event ongoing or interrupted"},
+            {WHY_ATTR_TRUNCATED, "baseline/event history incomplete"},
+            {WHY_ATTR_GAP, "system sampling gap"},
+            {WHY_ATTR_PARTIAL_SCAN, "partial scan or lifecycle tracking"},
+            {WHY_ATTR_SLOW_SCAN, "scan exceeds 200 ms"},
+            {WHY_ATTR_LOW_COVERAGE, "less than 90% observed-time coverage"},
+            {WHY_ATTR_ACCOUNTING,
+             "CPU accounting outside 80–105% or undefined"},
+            {WHY_ATTR_UNKNOWN_BASELINE, "insufficient per-process baselines"},
+            {WHY_ATTR_CAPACITY, "analysis identity capacity reached"}};
+        for (size_t i = 0; i < sizeof reasons / sizeof *reasons; ++i)
+            if ((event || reasons[i].bit != WHY_ATTR_UNKNOWN_BASELINE) &&
+                (r->issues & reasons[i].bit))
+                printf("      %s\n", reasons[i].text);
+    }
+    if (r->dropped)
+        printf("    %zu observations omitted at the identity cap.\n",
+               r->dropped);
+    puts("    Residual includes missing observations and accounting "
+         "differences; this is not proof of causality.");
+    why_attribution_destroy(r);
+}
+
+static void display_incident(const WhyHistory *history,
+                             const WhyCpuIncident *event, long hz) {
+    const char *status = event->status == WHY_INCIDENT_RECOVERED ? "recovered"
+                         : event->status == WHY_INCIDENT_INTERRUPTED
+                             ? "interrupted"
+                             : "ongoing (provisional)";
+    printf(
+        "  CPU spike %.3f..%.3f s: %s; baseline %.1f%%, sampled peak %.1f%%\n",
+        (double)event->start_ns / (double)WHY_SECOND,
+        (double)event->end_ns / (double)WHY_SECOND, status, event->baseline_pct,
+        event->peak_pct);
+    printf("    Peak interval %.3f..%.3f s; system CPU %.3f seconds\n",
+           (double)event->peak_start_ns / (double)WHY_SECOND,
+           (double)event->peak_end_ns / (double)WHY_SECOND, event->cpu_seconds);
+    display_attribution(history, event, hz);
+}
+
+static void display_spikes(const WhyHistory *history, long hz) {
+    puts("\nCPU spike analysis (whole-machine CPU; sampled intervals):");
+    size_t count = 0;
+    for (const WhyHistoryEntry *entry = why_history_first(history); entry;
+         entry = entry->next) {
+        if (entry->incident_completed) {
+            display_incident(history, &entry->incident, hz);
+            ++count;
+        }
+    }
+    const WhyCpuDetector *detector = why_history_detector(history);
+    WhyCpuIncident current;
+    if (why_detector_current(detector, &current)) {
+        display_incident(history, &current, hz);
+        ++count;
+    }
+    if (!count)
+        puts("  No confirmed CPU spike in retained summaries; this does not "
+             "rule out other problems.");
+    if (detector->state == WHY_WARMUP)
+        printf("  Baseline warming up: %zu/%u valid intervals.\n",
+               detector->baseline_count, WHY_BASELINE_MIN);
+    if (detector->state == WHY_CANDIDATE)
+        puts("  One high interval observed; waiting for confirmation.");
+    if (!count)
+        display_attribution(history, NULL, hz);
+}
+
 static void display(const WhyFrame *previous, const WhyFrame *current, long hz,
                     size_t sequence, bool details) {
     bool gap = previous && why_frame_discontinuity(previous, current);
@@ -176,8 +328,8 @@ int main(int argc, char **argv) {
              "--history displays the retained lifecycle timeline on exit.\n"
              "History is bounded to 300 seconds / 64 MiB and disappears on "
              "exit.\n"
-             "Spike detection and cross-terminal queries are not implemented "
-             "yet.");
+             "CPU spikes and contributor rankings are printed on exit. "
+             "Cross-terminal queries are not implemented yet.");
         return 0;
     }
     if (argc < 2 || strcmp(argv[1], "sample") != 0) {
@@ -233,7 +385,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     WhyHistory *history = why_history_create(
-        WHY_HISTORY_SECONDS * WHY_SECOND, WHY_HISTORY_BYTES, WHY_MAX_PROCESSES);
+        WHY_HISTORY_SECONDS * WHY_SECOND,
+        WHY_HISTORY_BYTES - WHY_ATTRIBUTION_BYTES, WHY_MAX_PROCESSES);
     if (!history) {
         perror("Cannot allocate history");
         why_frame_destroy(&frames[0]);
@@ -251,7 +404,7 @@ int main(int argc, char **argv) {
             status = 1;
             break;
         }
-        if (!why_history_append(history, current)) {
+        if (!why_history_append(history, current, hz)) {
             perror("Cannot retain sample");
             status = 1;
             break;
@@ -275,6 +428,7 @@ int main(int argc, char **argv) {
         }
     }
     display_history(history, timeline);
+    display_spikes(history, hz);
     why_history_destroy(history);
     why_frame_destroy(&frames[0]);
     why_frame_destroy(&frames[1]);

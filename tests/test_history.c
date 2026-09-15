@@ -59,24 +59,24 @@ static void test_lifecycle(void) {
     CHECK(h);
     WhyProcess p[] = {process(10, 100, 0)};
     WhyFrame f = frame(p, 1, 1, true);
-    CHECK(why_history_append(h, &f));
+    CHECK(why_history_append(h, &f, 100));
     CHECK(has_event(why_history_latest(h), WHY_FIRST_SEEN, 100));
     f = frame(p, 1, 2, true);
     p[0].status = WHY_DENIED;
-    CHECK(why_history_append(h, &f));
+    CHECK(why_history_append(h, &f, 100));
     CHECK(has_event(why_history_latest(h), WHY_VISIBILITY_LOST, 100));
     CHECK(!has_event(why_history_latest(h), WHY_NO_LONGER_OBSERVED, 100));
     f = frame(NULL, 0, 3, false);
-    CHECK(why_history_append(h, &f));
+    CHECK(why_history_append(h, &f, 100));
     CHECK(why_history_latest(h)->event_count == 0);
     p[0].status = WHY_READ_OK;
     f = frame(p, 1, 4, true);
-    CHECK(why_history_append(h, &f));
+    CHECK(why_history_append(h, &f, 100));
     CHECK(has_event(why_history_latest(h), WHY_VISIBILITY_RESTORED, 100));
     CHECK(!has_event(why_history_latest(h), WHY_FIRST_SEEN, 100));
     p[0].id.start_ticks = 200;
     f = frame(p, 1, 5, true);
-    CHECK(why_history_append(h, &f));
+    CHECK(why_history_append(h, &f, 100));
     CHECK(has_event(why_history_latest(h), WHY_NO_LONGER_OBSERVED, 100));
     CHECK(has_event(why_history_latest(h), WHY_FIRST_SEEN, 200));
     const WhyLifecycle *gone = &why_history_latest(h)->events[0];
@@ -84,19 +84,19 @@ static void test_lifecycle(void) {
           gone->latest_ns == 5 * WHY_SECOND);
     f = frame(p, 1, 6, true);
     p[0].metadata_changed = true;
-    CHECK(why_history_append(h, &f));
+    CHECK(why_history_append(h, &f, 100));
     CHECK(has_event(why_history_latest(h), WHY_METADATA_CHANGED, 200));
     f = frame(NULL, 0, 7, true);
-    CHECK(why_history_append(h, &f));
+    CHECK(why_history_append(h, &f, 100));
     CHECK(has_event(why_history_latest(h), WHY_NO_LONGER_OBSERVED, 200));
     f = frame(p, 1, 10, true);
     p[0].metadata_changed = false;
-    CHECK(why_history_append(h, &f));
+    CHECK(why_history_append(h, &f, 100));
     CHECK(why_history_latest(h)->sampling_gap);
-    CHECK(!why_history_append(h, &f) && errno == EINVAL);
+    CHECK(!why_history_append(h, &f, 100) && errno == EINVAL);
     f = frame(p, 1, 11, false);
     p[0].status = WHY_GONE;
-    CHECK(why_history_append(h, &f));
+    CHECK(why_history_append(h, &f, 100));
     CHECK(has_event(why_history_latest(h), WHY_NO_LONGER_OBSERVED, 200));
     why_history_destroy(h);
 }
@@ -107,7 +107,7 @@ static void test_retention(void) {
     WhyProcess p[] = {process(10, 100, 0)};
     for (unsigned tick = 1; tick <= 100; ++tick) {
         WhyFrame f = frame(p, 1, tick, true);
-        CHECK(why_history_append(h, &f));
+        CHECK(why_history_append(h, &f, 100));
         CHECK(why_history_stats(h).bytes <= why_history_stats(h).budget);
     }
     WhyHistoryStats stats = why_history_stats(h);
@@ -117,20 +117,22 @@ static void test_retention(void) {
           0); /* identity survives frame eviction */
     why_history_destroy(h);
 
-    h = why_history_create(300 * WHY_SECOND, 40000, 2);
+    h = why_history_create(300 * WHY_SECOND, (sizeof(WhyCpuDetector) + 40000),
+                           2);
     CHECK(h);
     for (unsigned tick = 1; tick <= 20; ++tick) {
         WhyFrame f = frame(p, 1, tick, true);
-        CHECK(why_history_append(h, &f));
-        CHECK(why_history_stats(h).bytes <= 40000);
+        CHECK(why_history_append(h, &f, 100));
+        CHECK(why_history_stats(h).bytes <= (sizeof(WhyCpuDetector) + 40000));
     }
     CHECK(why_history_stats(h).evicted_frames > 0);
     why_history_destroy(h);
 
-    h = why_history_create(300 * WHY_SECOND, 1024, 1);
+    h = why_history_create(300 * WHY_SECOND, (sizeof(WhyCpuDetector) + 1024),
+                           1);
     CHECK(h);
     WhyFrame f = frame(p, 1, 1, true);
-    CHECK(!why_history_append(h, &f) && errno == ENOSPC);
+    CHECK(!why_history_append(h, &f, 100) && errno == ENOSPC);
     CHECK(why_history_stats(h).frames == 0);
     why_history_destroy(h);
 
@@ -138,14 +140,14 @@ static void test_retention(void) {
     CHECK(h);
     WhyProcess many[] = {process(10, 100, 0), process(20, 200, 0)};
     f = frame(many, 2, 1, true);
-    CHECK(why_history_append(h, &f));
+    CHECK(why_history_append(h, &f, 100));
     CHECK(why_history_stats(h).tracking_dropped == 1);
     CHECK(why_history_latest(h)->tracking_dropped == 1);
     f = frame(NULL, 0, 2, false);
-    CHECK(why_history_append(h, &f));
+    CHECK(why_history_append(h, &f, 100));
     CHECK(!has_event(why_history_latest(h), WHY_NO_LONGER_OBSERVED, 100));
     f = frame(&many[1], 1, 3, true);
-    CHECK(why_history_append(h, &f));
+    CHECK(why_history_append(h, &f, 100));
     CHECK(has_event(why_history_latest(h), WHY_FIRST_SEEN, 200));
     CHECK(has_event(why_history_latest(h), WHY_NO_LONGER_OBSERVED, 100));
     why_history_destroy(h);
@@ -153,10 +155,10 @@ static void test_retention(void) {
     h = why_history_create(5 * WHY_SECOND, 100000, 2);
     CHECK(h);
     f = frame(p, 1, 1, true);
-    CHECK(why_history_append(h, &f));
+    CHECK(why_history_append(h, &f, 100));
     f = frame(p, 1, 2, true);
     f.boot_ns += 1000 * WHY_SECOND;
-    CHECK(why_history_append(h, &f));
+    CHECK(why_history_append(h, &f, 100));
     CHECK(why_history_stats(h).frames == 1);
     CHECK(why_history_latest(h)->sampling_gap);
     why_history_destroy(h);
@@ -213,7 +215,7 @@ static void test_metadata(void) {
     WhyFrame f = frame(pair, 2, 1, true);
     why_resolve_parents(&f);
     CHECK(pair[1].parent_metadata == a.metadata);
-    CHECK(why_history_append(h, &f));
+    CHECK(why_history_append(h, &f, 100));
     why_metadata_release(pair[1].parent_metadata);
     why_metadata_release(a.metadata);
     why_metadata_release(b.metadata);

@@ -2,13 +2,14 @@
 
 ## Current status
 
-The process/CPU collector and metadata/history milestones are implemented.
-The [v0.1 specification](v0.1-spec.md) remains the target for spike detection,
-incremental attribution, and a recorder/query interface. Those parts do not exist
-yet, even though the build uses a development version of `0.1.0`.
+The collector, metadata/history, interval alignment, CPU spike detection, and
+contributor ranking milestones are implemented. The recorder/query interface in
+the [v0.1 specification](v0.1-spec.md) is still pending; the build version `0.1.0`
+still denotes development work.
 
 The command currently available is `why sample`. It provides a diagnostic view
-and an optional lifecycle timeline; it does not yet explain a CPU spike.
+with an optional lifecycle timeline, CPU spike summaries, and total/incremental
+contributor rankings.
 
 ## Code map
 
@@ -19,6 +20,10 @@ and an optional lifecycle timeline; it does not yet explain a CPU spike.
 | `src/procfs.c` | Bounded file reads, frame collection, clocks, scan diagnostics. |
 | `src/metadata.c` | Context reads, identity rechecks, refresh policy, immutable snapshot ownership. |
 | `src/history.h`, `src/history.c` | Retained frames, lifecycle tracking, byte/time eviction, borrowed history views. |
+| `src/cpu_analysis.h`, `src/cpu_analysis.c` | Overlap estimates and the fixed-size median/MAD detector state machine. |
+| `tests/test_cpu_analysis.c` | Alignment, confirmation, recovery, gap and history integration fixtures. |
+| `src/attribution.h`, `src/attribution.c` | Bounded identity aggregation, baseline rates, sibling grouping, rankings and quality gates. |
+| `tests/test_attribution.c` | Total/increment separation, grouping, clipping, unknown baselines and quality regressions. |
 | `src/main.c` | CLI options, sampling cadence, escaped diagnostic output. |
 | `tests/test_core.c` | Parser, CPU, identity, clock and collector integration fixtures. |
 | `tests/test_history.c` | Metadata, ownership, lifecycle and retention regressions. |
@@ -27,10 +32,12 @@ and an optional lifecycle timeline; it does not yet explain a CPU spike.
 The pipeline is:
 
 ```text
-procfs reads → typed observations → retained snapshots + lifecycle observations
-                        ↓                            ↓
-               adjacent CPU deltas            bounded history
-                        └──────── diagnostic CLI ────┘
+procfs reads → typed observations → bounded history + lifecycle observations
+                     ↓                     ↓
+             adjacent CPU deltas     spike detection
+                                           ↓
+                              aligned contributor rankings
+                     └──────── diagnostic CLI ────────┘
 ```
 
 Core tests can use synthetic counters or a temporary procfs-shaped directory.
@@ -100,9 +107,11 @@ internal history views are borrowed and may become invalid on the next append.
 | Each context field | 4096 bytes, then explicit truncation |
 | Context allocations per working frame | 8 MiB |
 | Retention target | 300 seconds |
-| Recording quota | 64 MiB |
+| History quota | 48 MiB |
+| Attribution reservation | 16 MiB, including scratch arrays |
+| Attribution identities | 32768 |
 
-The recording quota includes history structures, both fixed tracking arrays,
+The history quota includes history structures, both fixed tracking arrays,
 event/frame allocations, and metadata reference charges. Shared metadata is
 conservatively charged per snapshot reference, so quota eviction can happen before
 physical allocation reaches that amount. Oversized snapshots fail explicitly.
@@ -113,30 +122,79 @@ System parsing currently requires ten CPU accounting columns through `guest_nice
 Unsupported or truncated input fails explicitly. These are prototype limits, not
 a promise of universal Linux compatibility.
 
-## Validation baseline
+## CPU analysis milestone
 
-At the metadata/history milestone:
+The pure CPU analysis module clips each valid process interval to a requested
+window using a uniform-rate assumption. Adjacent disjoint windows conserve the
+original CPU seconds. History alignment walks retained adjacent frames and emits
+observed portions through an optional visitor. It does not allocate or rank
+contributors. It skips discontinuities and reports missing boundaries and quality
+limitations. Requests beyond the latest system observation are provisional.
 
-- Four CTest entries passed on macOS with AppleClang and ASan/UBSan.
-- Five CTest entries passed on an x86_64 Debian VM with Linux 6.12.107,
-  GCC 14.2.0, ASan/UBSan, and `-Werror`.
-- The Linux test started a controlled process and verified both its first-seen
-  and no-longer-observed entries. Test artifacts were removed afterward.
-- A separate five-frame live run observed 161 entries per scan with no skipped
-  entries or read/parse errors. Scan times were approximately 36–75 ms in that run.
+The detector stores at most thirty baseline intervals, one candidate, three
+pending recovery intervals and an active aggregate. It contains no pointers into
+history. Its storage is included in the history quota. Each completion is copied
+into its recording frame; frame eviction removes that completed summary. An
+ongoing aggregate survives eviction without pinning old raw data. Alignment is
+computed from what is still available, and presentation labels missing prefixes.
+Algorithm version 1 implements the thresholds in the specification.
 
-These are completed smoke/regression results, not a repeatable performance study.
-Other QEMU runs exceeded the 200 ms scan-quality threshold. The specification's
-CPU-overhead and 1000-process targets still require proper benchmarking.
-GitHub Actions is configured for Linux GCC/Clang and macOS Clang; its workflow
-file alone does not establish that hosted CI has passed.
+Regression fixtures cover threshold freezing, an enter threshold above 100%,
+noisy baselines, bounded baseline history, one-interval pulses, recovery rollback,
+interruption, invalid values, overlap conservation, PID reuse, and an event that
+outlives its raw history. CPU detection does not use process visibility as proof
+of cause. Attribution is implemented separately as described below.
 
-## Next milestones
+## Attribution milestone
 
-1. Align process CPU intervals with system sampling windows while conserving totals.
-2. Implement the specified baseline, spike-confirmation and recovery state machine.
-3. Rank total and incremental CPU contributions; retain unknown/unaccounted activity.
-4. Add the foreground recorder and cross-terminal query interface.
+Attribution borrows immutable history and returns owned row/index arrays. Destroy
+its result before appending to history or releasing it. A bounded identity hash
+table collects process observations; system-bin passes accumulate aligned CPU
+and coverage, then deterministic sorts produce sibling groups and both rankings.
+Each process's portions are combined within a bin before positive excess is taken.
+Scratch arrays and result arrays together must fit the 16 MiB reservation.
 
-Each stage should add deterministic fixtures before expanding the user-facing
-claims. See [CONTRIBUTING.md](../CONTRIBUTING.md) for the development workflow.
+Baseline coverage, new-process zero baselines, signed residuals and label gates
+follow the [usage guide](usage.md#contributor-rankings). Capacity omissions, missing
+boundaries, slow/partial scans, and unknown baselines remain visible. Completed
+incident aggregates can outlive raw intervals; ranking totals use only comparable
+retained system intervals. No valid interval means unavailable, not zero CPU.
+
+Fixtures cover a constant four-core service versus a three-core increase, new
+processes, unknown/partial baselines, same/different parents and executables,
+context changes, fractional bin clipping, missing reads, accounting mismatch,
+slow/partial scans, baseline gaps, eviction, empty measurements and capacity limits.
+Direct parent identity is shown; ancestor rollups and automatic lifecycle-based
+explanations are still pending. Performance targets have not been benchmarked.
+
+## Validation
+
+Latest completed validation at the attribution milestone (2026-09-15):
+
+| Environment | Result | Checks |
+|---|---|---|
+| macOS / AppleClang | 6/6 CTest entries passed | ASan and UBSan |
+| x86_64 Debian VM / GCC 14.2.0 | 7/7 CTest entries passed | ASan, UBSan and `-Werror` |
+
+The portable suite covers core parsing/arithmetic, history ownership, CPU analysis,
+attribution, CLI help and invalid arguments. Linux also runs a controlled live
+process-lifecycle test. Live smoke runs checked total rankings and the single-sample
+unavailable case. Formatting and repository-local Markdown links were checked.
+See [CONTRIBUTING.md](../CONTRIBUTING.md#build-and-test) to reproduce the suite.
+
+These results are regression and smoke checks, not a performance study. QEMU runs
+can exceed the 200 ms scan-quality threshold. The CPU-overhead and 1000-process
+targets still require benchmarking. GitHub Actions is configured for Linux
+GCC/Clang and macOS Clang; hosted CI results have not been verified here.
+
+## Remaining work
+
+1. Add the foreground recorder and cross-terminal query interface. `why watch`,
+   `why cpu` and `why 60s` remain planned commands.
+2. Expand contextual explanations, including ancestor views and lifecycle timing
+   correlations, while preserving polling uncertainty.
+3. Benchmark recording overhead and retention under larger process populations.
+
+There is no persistent recording format or restart recovery. The current build
+is a development checkpoint, not a completed v0.1 release. Each stage should add
+deterministic fixtures before expanding user-facing claims.

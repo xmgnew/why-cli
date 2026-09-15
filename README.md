@@ -3,12 +3,12 @@
 Understand what your computer just did.
 
 A CPU burst can be over before you open a process monitor. `why` is being built
-as a local recorder that keeps recent process activity and, eventually, explains
-which processes contributed to an increase in CPU use.
+as a local recorder that keeps recent process activity and estimates which
+observed processes contributed to an increase in CPU use.
 
 **Status: early Linux prototype.** Process sampling, metadata, lifecycle
-observations, and bounded history work today. Spike detection and contributor
-ranking are the next milestones. This is not yet the complete v0.1 experience.
+observations, bounded history, CPU spike detection, and contributor rankings
+work today. This is not yet the complete v0.1 experience.
 
 ## Try it
 
@@ -23,13 +23,16 @@ export TMPDIR="$PWD/build/tmp"
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 (cd build && ctest --output-on-failure)
-./build/why sample --count 10 --history
+./build/why sample --count 30 --history
 ```
 
-This takes ten samples at a nominal one-second cadence, prints process CPU
+This takes thirty samples at a nominal one-second cadence, prints process CPU
 measurements, and shows retained lifecycle observations on completion. The first
 sample establishes counters; CPU rates become available from the second sample.
-Ctrl-C stops collection and prints the retained summary.
+Ctrl-C stops collection and prints the retained summary. CPU spike analysis is
+printed on exit. At least eleven samples are needed for the ten baseline
+intervals, followed by additional samples to confirm a spike. A quiet recording
+may have no spike; the summary still shows retained total CPU rankings.
 
 ```sh
 ./build/why sample --count 30             # Process and CPU samples
@@ -49,6 +52,9 @@ fixture tests, but does not support live sampling yet. See the
 - Immutable snapshots of arguments, working directory, and executable path.
 - First-seen, lost/restored visibility, disappearance, and metadata-change observations.
 - In-memory history targeting 300 seconds within a 64 MiB recording budget.
+- Baseline-based CPU spike summaries with recovery and interruption states.
+- Separate total and incremental CPU rankings, with conservative sibling grouping.
+- Time-aligned estimates of observed process CPU, without extrapolating missing data.
 - Explicit diagnostics for missing data, partial scans, timing gaps, and truncation.
 
 The recorder runs without root and uses procfs polling. It makes no network
@@ -67,16 +73,17 @@ and cannot reconstruct activity from before recording started. `n/a` means the
 measurement is unavailable, not zero. A process disappearance is an observation,
 not proof of when or why it exited.
 
-The 64 MiB recording budget includes history structures and conservatively charged
-metadata references. Collector working buffers have separate limits, so this is
-not a total RSS guarantee. Memory pressure can shorten the retained history.
+The 64 MiB budget reserves 48 MiB for history and conservatively charged metadata
+references, and 16 MiB for attribution analysis. Collector working buffers have
+separate limits, so this is not a total RSS guarantee. Memory pressure can shorten
+the retained history.
 
 ## Road to v0.1
 
 1. **Complete:** process/CPU collection, metadata, lifecycle observations, bounded history.
-2. **Next:** align sampling intervals and detect sustained CPU spikes.
-3. **Then:** rank total and incremental CPU contributions with explicit uncertainty.
-4. **Later in v0.1:** foreground recorder and cross-terminal queries.
+2. **Complete:** sampling interval alignment and sustained CPU spike detection.
+3. **Complete:** total and incremental CPU contributor ranking with explicit uncertainty.
+4. **Next:** foreground recorder and cross-terminal queries.
 
 `why watch`, `why cpu`, and `why 60s` are planned interfaces, not available commands.
 Memory, disk, network, a TUI, and live macOS support are outside the current scope.
@@ -84,6 +91,7 @@ Memory, disk, network, a TUI, and live macOS support are outside the current sco
 ## Development
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) for build, test, and review conventions.
+The [changelog](CHANGELOG.md) records development milestones.
 The [implementation guide](docs/implementation.md) describes module ownership,
 resource limits, current validation, and remaining work. The detailed
 [v0.1 design specification](docs/v0.1-spec.md) is currently written in Chinese.
