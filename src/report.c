@@ -1,4 +1,5 @@
 #include "report.h"
+#include "context.h"
 #include <inttypes.h>
 #include <string.h>
 #include <unistd.h>
@@ -201,6 +202,69 @@ static void attribution_result(FILE *out, const WhyAttribution *r, bool event) {
 			  "differences; this is not proof of causality.");
 }
 
+static void display_context(FILE *out, const WhyHistory *history,
+							const WhyAttribution *r,
+							const WhyCpuIncident *event, long hz) {
+	if (!r->count)
+		return;
+	line(
+		out,
+		"    Context for the leading rows (observations, not additional CPU):");
+	for (size_t j = 0; j < r->count && j < 3; ++j) {
+		size_t i = event ? r->increment_order[j] : j;
+		const WhyContributor *row = &r->rows[i];
+		WhyParentChain chain = why_parent_chain(history, row->context);
+		fprintf(out, "      %u:%" PRIu64 "%s", row->identity.pid,
+				row->identity.start_ticks,
+				row->members > 1 ? " [representative member only]" : "");
+		if (!chain.available) {
+			line(out, " parent snapshot unavailable");
+			continue;
+		}
+		fprintf(out, " parent snapshot at %.3f s:",
+				(double)chain.observed_ns / (double)WHY_SECOND);
+		for (size_t k = 0; k < chain.count; ++k) {
+			const WhyProcess *p = chain.ancestors[k];
+			fprintf(out, " <- %u:%" PRIu64 " ", p->id.pid, p->id.start_ticks);
+			size_t length = strlen(p->comm);
+			escaped_bytes(out, (const unsigned char *)p->comm,
+						  length > 32 ? 32 : length);
+			if (length > 32 || p->comm_truncated)
+				fputs(" [name truncated]", out);
+		}
+		const char *ends[] = {" [root]", " [parent unknown]",
+							  " [parent snapshot unavailable]",
+							  " [cycle stopped]", " [8-level limit]"};
+		line(out, ends[chain.end]);
+		if (!event)
+			continue;
+		if (row->members > 1) {
+			line(out, "        Member lifecycle timing is not generalized to "
+					  "the group.");
+			continue;
+		}
+		WhyTimingContext timing =
+			why_timing_context(history, row->identity, event, hz);
+		if (timing.start_near_rise)
+			fprintf(out,
+					"        Estimated start %.3f..%.3f s is near CPU rise "
+					"(tick/clock uncertainty included).\n",
+					(double)timing.start_earliest_ns / (double)WHY_SECOND,
+					(double)timing.start_latest_ns / (double)WHY_SECOND);
+		if (timing.loss_near_recovery)
+			fprintf(out,
+					"        No-longer-observed interval %.3f..%.3f s overlaps "
+					"the recovery vicinity; not an exact exit.\n",
+					(double)timing.loss_earliest_ns / (double)WHY_SECOND,
+					(double)timing.loss_latest_ns / (double)WHY_SECOND);
+		if (!timing.start_near_rise && !timing.loss_near_recovery)
+			line(out, "        No supported near-event lifecycle timing "
+					  "evidence in retained history.");
+	}
+	line(out, "    Parent snapshots can change; timing correlations do not "
+			  "prove cause or change rankings.");
+}
+
 static void display_attribution(FILE *out, const WhyHistory *history,
 								const WhyCpuIncident *event, long hz) {
 	WhyAttribution *r =
@@ -212,6 +276,7 @@ static void display_attribution(FILE *out, const WhyHistory *history,
 		return;
 	}
 	attribution_result(out, r, event != NULL);
+	display_context(out, history, r, event, hz);
 	why_attribution_destroy(r);
 }
 
@@ -394,6 +459,7 @@ void why_report_query(FILE *out, const WhyHistory *history, long hz,
 	if (total) {
 		line(out, "Query-window totals (not full-event totals):");
 		attribution_result(out, total, false);
+		display_context(out, history, total, NULL, hz);
 		why_attribution_destroy(total);
 	} else
 		line(out, "Query-window contributor analysis unavailable.");

@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +16,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#define RESPONSE_BYTES (64U * 1024U)
+#define RESPONSE_BYTES (128U * 1024U)
 #define CLIENT_TIMEOUT (2 * WHY_SECOND)
 struct WhyServer {
 	int listener, client, lock;
@@ -26,6 +27,7 @@ struct WhyServer {
 	bool replying, bound;
 };
 
+#ifndef __linux__
 static bool private_dir(const char *path, bool create) {
 	struct stat st;
 	if (create && mkdir(path, 0700) < 0 && errno != EEXIST)
@@ -70,6 +72,7 @@ static bool socket_path(char *path, size_t size, bool create) {
 	}
 	return true;
 }
+#endif
 static bool flags(int fd) {
 	return fcntl(fd, F_SETFD, FD_CLOEXEC) >= 0 &&
 		   fcntl(fd, F_SETFL, O_NONBLOCK) >= 0;
@@ -89,11 +92,45 @@ static bool same_user(int fd) {
 	return false;
 #endif
 }
-static struct sockaddr_un address(const char *path) {
-	struct sockaddr_un addr = {0};
-	addr.sun_family = AF_UNIX;
-	memcpy(addr.sun_path, path, strlen(path) + 1);
-	return addr;
+static bool address(struct sockaddr_un *addr, socklen_t *length, char *path,
+					size_t size, bool create) {
+	memset(addr, 0, sizeof *addr);
+	addr->sun_family = AF_UNIX;
+#ifdef __linux__
+	(void)path;
+	(void)size;
+	(void)create;
+	const char *name = getenv("WHY_SOCKET_NAME");
+	if (!name || !*name)
+		name = "default";
+	if (strlen(name) > 64) {
+		errno = ENAMETOOLONG;
+		return false;
+	}
+	for (const char *p = name; *p; ++p) {
+		if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+			  (*p >= '0' && *p <= '9') || *p == '-' || *p == '_')) {
+			errno = EINVAL;
+			return false;
+		}
+	}
+	/* A leading NUL selects Linux's filesystem-independent namespace.
+	 * The exact address length excludes the terminating string NUL. */
+	int n = snprintf(addr->sun_path + 1, sizeof addr->sun_path - 1,
+					 "why-cli.%lu.%s", (unsigned long)geteuid(), name);
+	if (n < 0 || (size_t)n >= sizeof addr->sun_path - 1) {
+		errno = ENAMETOOLONG;
+		return false;
+	}
+	*length =
+		(socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + (size_t)n);
+#else
+	if (!socket_path(path, size, create))
+		return false;
+	memcpy(addr->sun_path, path, strlen(path) + 1);
+	*length = sizeof *addr;
+#endif
+	return true;
 }
 static void client_close(WhyServer *s) {
 	if (s->client >= 0)
@@ -110,7 +147,7 @@ void why_server_close(WhyServer *s) {
 		close(s->listener);
 	/* The lock stays held through unlink; the lock file is intentionally kept.
 	 */
-	if (s->bound)
+	if (s->bound && s->path[0])
 		unlink(s->path);
 	if (s->lock >= 0)
 		close(s->lock);
@@ -121,8 +158,11 @@ WhyServer *why_server_open(void) {
 	if (!s)
 		return NULL;
 	s->listener = s->client = s->lock = -1;
-	if (!socket_path(s->path, sizeof s->path, true))
+	struct sockaddr_un addr;
+	socklen_t length;
+	if (!address(&addr, &length, s->path, sizeof s->path, true))
 		goto fail;
+#ifndef __linux__
 	char lock_path[sizeof s->path + 8];
 	snprintf(lock_path, sizeof lock_path, "%s.lock", s->path);
 	s->lock = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
@@ -148,14 +188,14 @@ WhyServer *why_server_open(void) {
 			goto fail;
 	} else if (errno != ENOENT)
 		goto fail;
+#endif
 	s->listener = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (s->listener < 0 || !flags(s->listener))
 		goto fail;
-	struct sockaddr_un addr = address(s->path);
-	if (bind(s->listener, (struct sockaddr *)&addr, sizeof addr) < 0)
+	if (bind(s->listener, (struct sockaddr *)&addr, length) < 0)
 		goto fail;
 	s->bound = true;
-	if (chmod(s->path, 0600) < 0 || listen(s->listener, 4) < 0)
+	if ((s->path[0] && chmod(s->path, 0600) < 0) || listen(s->listener, 4) < 0)
 		goto fail;
 	return s;
 fail:;
@@ -270,13 +310,14 @@ bool why_server_wait(WhyServer *s, const WhyHistory *history, long hz,
 int why_client_query(unsigned seconds) {
 	char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 	int fd = -1;
-	if (!socket_path(path, sizeof path, false))
+	struct sockaddr_un addr;
+	socklen_t address_length;
+	if (!address(&addr, &address_length, path, sizeof path, false))
 		goto fail;
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0 || !flags(fd))
 		goto fail;
-	struct sockaddr_un addr = address(path);
-	if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+	if (connect(fd, (struct sockaddr *)&addr, address_length) < 0) {
 		if (errno != EINPROGRESS)
 			goto fail;
 		struct pollfd p = {.fd = fd, .events = POLLOUT};

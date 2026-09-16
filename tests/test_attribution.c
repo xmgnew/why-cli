@@ -282,6 +282,9 @@ static void test_query_window(void) {
 	CHECK(strstr(report, "Query window: 12.000..14.000"));
 	CHECK(strstr(report, "system=14.000, processes=14.000"));
 	CHECK(strstr(report, "FULL EVENT results"));
+	CHECK(strstr(report, "Context for the leading rows"));
+	CHECK(strstr(report,
+				 "timing correlations do not prove cause or change rankings"));
 	CHECK(strstr(report, "CPU spike 11.000..14.000"));
 	out = fmemopen(report, sizeof report, "w");
 	CHECK(out);

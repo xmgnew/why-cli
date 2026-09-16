@@ -5,7 +5,29 @@ completed v0.1 release; the CMake version `0.1.0` is a development version.
 
 ## Unreleased
 
-### Foreground recorder and queries
+### Context evidence
+
+- Show up to eight ancestor levels from the contributor's original retained
+  snapshot, stopping on missing identities, cycles or the depth limit.
+- Add conservative start-near-rise and disappearance-near-recovery evidence;
+  keep tick/clock uncertainty, gaps, history expiry and unknown values explicit.
+- Label group context as a representative member and avoid group-wide lifecycle
+  claims. Context never changes CPU totals, increment rankings or quality gates.
+- Add context fixtures and escaped-output regressions; increase the bounded IPC
+  response buffer to 128 KiB for ancestor output.
+
+### Runtime lifecycle
+
+- Switch Linux recording/query IPC to abstract Unix sockets: no runtime directory,
+  socket file or lock file is created. Closing the endpoint, including after
+  forced termination, permits restart without stale-file cleanup.
+- Preserve same-UID checks and atomic duplicate prevention. `WHY_SOCKET_NAME`
+  selects an independent session; Linux ignores the old `WHY_RUNTIME_DIR` setting.
+- Leave old-version artifacts untouched and document migration. macOS live
+  recording remains unsupported; its build-local IPC fixtures are unchanged.
+- Add Linux forced-termination/rebind and no-runtime-file regression checks.
+
+### Foreground recorder and queries (previous checkpoint)
 
 - Add `why watch` and same-user cross-terminal queries: `why`, `why Ns` and
   `why cpu [Ns]`, with a default 60-second window and a range of 1..300 seconds.
@@ -49,7 +71,7 @@ completed v0.1 release; the CMake version `0.1.0` is a development version.
 
 ### Still planned
 
-Richer contextual explanations and performance benchmarking, including query
-latency and recording overhead. See the [implementation guide](docs/implementation.md)
+Performance benchmarking, including query latency and recording overhead, and
+explicit opt-in query metadata expansion. See the [implementation guide](docs/implementation.md)
 for current limits and validation, and the [usage guide](docs/usage.md) for available
 commands. Rankings estimate observed contributions; they do not prove causality.

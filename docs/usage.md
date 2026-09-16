@@ -43,28 +43,38 @@ cadence without printing every process table. In another terminal, use `why`,
 range is `1s` through `300s`. Queries return a snapshot and exit. `watch` and query
 commands do not accept `sample` options such as `--details` or `--history`.
 
-The default runtime directory is `$XDG_RUNTIME_DIR/why-cli`. The XDG directory must
-exist, belong to the current user and exclude group/other permissions. To use an
-explicit directory, set `WHY_RUNTIME_DIR` to the same absolute path in both
-terminals. For a repository-local session:
+Linux uses an abstract Unix socket named for the effective UID and session, with
+no filesystem pathname. The default session is `default`. You do not need
+`XDG_RUNTIME_DIR`, and the old `WHY_RUNTIME_DIR` setting is ignored on Linux.
+To select an independent recorder, set the same session name in both terminals:
 
 ```sh
-export WHY_RUNTIME_DIR="$PWD/build/why-runtime"
+export WHY_SOCKET_NAME=experiment
 ./build/why watch
-# In another terminal, set the same variable, then run ./build/why
+# In another terminal: export WHY_SOCKET_NAME=experiment; ./build/why
 ```
 
-The recorder creates the final directory with mode 0700 if needed; its parent must
-already exist. Existing final directories must be private, owned by the current
-user and not symlinks. Paths must fit the platform's Unix socket path limit.
-There is no automatic fallback to a shared temporary or home directory. Both
-peers verify that the other endpoint has the same effective UID.
+Names accept 1–64 ASCII letters, digits, hyphens or underscores; an unset or empty
+variable selects `default`. Each effective UID/session pair has one recorder per
+Linux network namespace. A second recorder cannot bind the same endpoint. Both
+peers check the other's UID before exchanging reports; endpoint names are not
+secrets or authentication credentials.
 
-Only one recorder may own a runtime directory. Ctrl-C/SIGTERM releases history and
-removes the socket. A small empty lock file and its directory remain for safe
-coordination across restarts; neither contains recording data. After a crash, the
-next recorder can replace its stale socket while holding the lock. Do not manually
-remove a live recorder's lock file. Restarting always begins a new recording.
+There are no runtime directories, socket files, lock files, logs or saved history
+created by the Linux recorder. Closing all socket references releases the endpoint,
+including after SIGKILL, without a filesystem cleanup step. Restarting starts a
+new in-memory recording. Output redirected by your shell and build artifacts are
+separate from this guarantee; OS-managed diagnostics are outside program control.
+
+**Migration:** stop the previous recorder before running this version. Old
+filesystem-based recorders and new clients cannot communicate. Existing directories
+and empty locks from an older version are not automatically deleted: after stopping
+that old recorder, you may remove its known runtime directory if it contains no
+other files. No scanning or removal of arbitrary directories is performed.
+
+macOS live recording remains unsupported. Its portable IPC fixture still uses a
+private pathname socket inside the build directory and removes fixture artifacts.
+This is not the design or a cleanup guarantee for a future macOS recorder.
 
 Query output includes:
 
@@ -219,6 +229,40 @@ History uses up to 48 MiB, with another 16 MiB reserved for bounded analysis wit
 the 64 MiB recording/analysis budget. Collector and IPC buffers are separately bounded;
 this is not an RSS limit. Reaching the analysis identity cap is reported explicitly.
 
+## Parent chains and lifecycle timing
+
+After rankings, the leading three rows get a context section: incremental leaders
+for an event, total leaders when there is no event. Query-window totals have their
+own total-leader context. These details never add CPU to ancestors or change a
+contributor's score or primary-contributor label.
+
+Parent chains use the same retained frame as that row's context observation. Each
+node shows PID/start-time identity and an escaped name, limited to 32 name bytes
+for compact output. At most eight ancestor levels are shown. Unknown or missing
+parents, identity mismatches, cycles and the depth limit stop the chain explicitly.
+Later observations never replace the original parent identity. The printed time
+identifies the child observation anchoring the snapshot; a procfs scan is not an
+atomic observation of all processes. A grouped row shows only its representative
+member's parent snapshot, not a claim about every member's ancestry.
+
+For individual event contributors, two conservative pieces of timing evidence
+may appear:
+
+- **Estimated start near CPU rise:** the entire start-time uncertainty interval
+  lies within two seconds of the rise. The estimate includes kernel tick resolution
+  and the bracket between monotonic and boot-time reads. It requires retained
+  continuous observations reaching back before the estimated birth; gaps, suspend
+  boundaries, expired history or inconsistent/future clocks withhold the evidence.
+  First-seen time is never substituted for start time.
+- **No longer observed near recovery:** a retained disappearance interval overlaps
+  the two-second neighborhood of a recovered event's end. The full observation-loss
+  interval is printed, even if broad. A partial scan or visibility-loss observation
+  alone is insufficient. Ongoing or interrupted events do not claim recovery.
+
+A timing match is correlation, not proof of cause. Missing evidence means the
+retained data cannot support the statement; it does not prove that no relationship
+exists. A group does not inherit lifecycle conclusions from one representative.
+
 ## Context and privacy
 
 Context is read on first observation and refreshed after ten seconds or an observed
@@ -242,8 +286,8 @@ especially when `--details` is enabled.
 | Message or symptom | What to check |
 |---|---|
 | Live collection requires Linux | macOS supports fixture tests only. Run live sampling on Linux. |
-| Cannot query recorder | Start `why watch` and use the same runtime directory in both terminals. There is no history after watch exits. |
-| Cannot start recorder | Check for an existing recorder, directory ownership/permissions, and Unix socket path length. |
+| Cannot query recorder | Start `why watch` and use the same `WHY_SOCKET_NAME` in both terminals. There is no history after watch exits. |
+| Cannot start recorder | Check for an existing recorder, a valid `WHY_SOCKET_NAME`. |
 | Query timeout | Retry after a slow scan or query completes. Large workloads and query load are not benchmarked yet. |
 | Cannot collect `/proc` | Check procfs availability and access in the current environment. Unsupported or malformed system input is rejected. |
 | Permission-denied fields | Some process information is restricted. Available CPU observations still remain useful; missing context is not fabricated. |

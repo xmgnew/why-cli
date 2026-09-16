@@ -4,8 +4,8 @@
 
 The collector, metadata/history, interval alignment, CPU spike detection, and
 contributor ranking and foreground recorder/query milestones are implemented.
-The [v0.1 specification](v0.1-spec.md) remains the design target; richer context
-and performance validation are pending. Version `0.1.0` denotes development work.
+The [v0.1 specification](v0.1-spec.md) remains the design target; optional query detail
+expansion and performance validation are pending. Version `0.1.0` denotes development work.
 
 `why watch` records in the foreground; `why`, `why Ns`, and `why cpu [Ns]` query
 its retained CPU history from another terminal. `why sample` remains available
@@ -25,9 +25,11 @@ for per-sample diagnostics and optional metadata/lifecycle output.
 | `src/attribution.h`, `src/attribution.c` | Bounded identity aggregation, baseline rates, sibling grouping, rankings and quality gates. |
 | `tests/test_attribution.c` | Total/increment separation, grouping, clipping, unknown baselines and quality regressions. |
 | `src/main.c` | CLI options, signals, sampling cadence and recorder lifetime. |
+| `src/context.h`, `src/context.c` | Same-snapshot ancestor traversal and conservative lifecycle timing evidence. |
+| `tests/test_context.c` | PID reuse, cycles/depth, clock uncertainty, gaps, expiry and escaped context output. |
 | `src/report.h`, `src/report.c` | Escaped diagnostic and query presentation to an explicit output stream. |
-| `src/ipc.h`, `src/ipc.c` | Private runtime endpoint, recorder lock, peer checks, bounded nonblocking request/response I/O. |
-| `tests/test_ipc.c` | Runtime permissions, request framing, duplicate/stale endpoints, disconnects and timeouts. |
+| `src/ipc.h`, `src/ipc.c` | Filesystem-free Linux endpoint, peer checks, bounded nonblocking request/response I/O. |
+| `tests/test_ipc.c` | Endpoint lifetime, request framing, duplicate prevention, disconnects and timeouts. |
 | `tests/linux_recorder.sh` | Live watch/query, continued sampling and shutdown integration. |
 | `tests/test_core.c` | Parser, CPU, identity, clock and collector integration fixtures. |
 | `tests/test_history.c` | Metadata, ownership, lifecycle and retention regressions. |
@@ -115,7 +117,7 @@ internal history views are borrowed and may become invalid on the next append.
 | Attribution reservation | 16 MiB, including scratch arrays |
 | Attribution identities | 32768 |
 | IPC request buffer | 32 bytes |
-| IPC response buffer | 64 KiB per endpoint |
+| IPC response buffer | 128 KiB per endpoint |
 | Simultaneously serviced query connections | 1; listen backlog 4 |
 | Full incidents shown per query | Latest 8 overlapping incidents |
 
@@ -173,8 +175,31 @@ Fixtures cover a constant four-core service versus a three-core increase, new
 processes, unknown/partial baselines, same/different parents and executables,
 context changes, fractional bin clipping, missing reads, accounting mismatch,
 slow/partial scans, baseline gaps, eviction, empty measurements and capacity limits.
-Direct parent identity is shown; ancestor rollups and automatic lifecycle-based
-explanations are still pending. Performance targets have not been benchmarked.
+Parent chains and lifecycle timing evidence are described below. Ancestor CPU
+rollups are deliberately excluded. Performance targets have not been benchmarked.
+
+## Context evidence
+
+`context.c` performs no collection, allocation or score mutation. Parent traversal
+accepts a borrowed process from a retained frame, finds that exact frame, and only
+follows identity-matched parents within it. A fixed eight-pointer result and cycle
+checks bound traversal; missing context is not backfilled from another frame.
+Results borrow history under the same lifetime rules as attribution results.
+
+Birth estimates convert start ticks through the frame's boot/monotonic bracket,
+round bounds outward and include one tick of uncertainty. The estimate must fall
+after the beginning of the retained continuous clock segment and before the first
+retained successful read. Rise correlation requires the entire estimate within
+±2 seconds and no retained clock discontinuity between birth/read and rise.
+Disappearance correlation uses only retained `WHY_NO_LONGER_OBSERVED` events for
+the exact identity and only recovered incidents; it does not infer an exit time.
+These conservative rules may withhold a true relationship when evidence is sparse.
+
+Presentation adds context for at most three leading rows per result and limits
+ancestor names to 32 bytes before escaping. Groups identify the representative
+member and withhold group-wide lifecycle claims. The fixed IPC response buffer is
+128 KiB to accommodate bounded ancestor output; oversized reports still fail
+explicitly. Arguments and cwd remain exclusive to `sample --details`.
 
 ## Foreground recorder and query transport
 
@@ -183,18 +208,30 @@ absolute sampling deadlines it polls a Unix stream socket. Accepted sockets use
 nonblocking I/O; one client is serviced at a time and has a two-second deadline.
 A disconnect cannot terminate the process through SIGPIPE. Query rendering borrows
 history synchronously, destroys attribution results, then sends owned text from a
-fixed 64 KiB buffer. No history pointer survives into asynchronous socket writes.
+fixed 128 KiB buffer. No history pointer survives into asynchronous socket writes.
 Rendering can still delay the next sample; missed intervals remain discontinuities.
 This is not a latency or throughput guarantee under heavy query load.
 
-Runtime lookup uses `WHY_RUNTIME_DIR` or `$XDG_RUNTIME_DIR/why-cli`. The final
-directory must be private and owned by the effective UID; final symlinks are
-rejected. The XDG parent is also checked when used. A non-symlink, private regular
-lock file is held with an advisory write lock for the recorder lifetime. Only
-its owner may remove a stale socket after acquiring that lock. Normal shutdown
-unlinks the socket before releasing the lock; the empty lock file remains to
-avoid creating competing lock inodes. Neither endpoint accepts a different UID:
-Linux uses `SO_PEERCRED`, and portable macOS IPC fixtures use `getpeereid`.
+Linux uses an abstract Unix socket, with a leading NUL in `sun_path` and an exact
+address length excluding the trailing string NUL. Its name is
+`why-cli.<effective UID>.<session>`, where `WHY_SOCKET_NAME` selects the session
+(default `default`; 1–64 ASCII letters/digits/hyphens/underscores). Bind provides
+atomic duplicate prevention without a separate lock. No filesystem socket,
+directory or lock is created; the kernel releases the endpoint when all socket
+references close. Descriptor close-on-exec prevents retention across exec.
+
+Linux `SO_PEERCRED` verifies the effective UID on both ends. Abstract endpoints
+have no filesystem permission protection; other users may attempt to connect or
+occupy a predictable name, but a different UID never receives a report or supplies
+an accepted response. A bind collision fails explicitly rather than falling back
+to a different endpoint. Isolation is per Linux network namespace.
+
+The previous Linux `WHY_RUNTIME_DIR` setting is ignored, and old-version runtime
+artifacts are left untouched. See [migration notes](usage.md#foreground-recording-and-cross-terminal-queries).
+Portable macOS fixtures retain the pathname/lock implementation with `getpeereid`
+and explicitly clean their build-local test directory. Live macOS recording is
+not implemented; it needs a separate lifecycle design before support is claimed.
+The Linux mechanism follows [unix(7)](https://man7.org/linux/man-pages/man7/unix.7.html).
 
 The internal versioned protocol is one canonical ASCII request, `WHY/1 N\n`,
 where N is 1..300. Responses use `WHY/1 OK\n`, bounded report text, and a final
@@ -212,19 +249,20 @@ Only eight latest overlapping incidents are rendered, with omissions counted.
 
 ## Validation
 
-Latest completed validation at the recorder/query milestone (2026-09-16):
+Latest completed validation after the context evidence update (2026-09-16):
 
 | Environment | Result | Checks |
 |---|---|---|
-| macOS / AppleClang | 13/13 CTest entries passed | ASan and UBSan |
-| x86_64 Debian VM / GCC 14.2.0 | 15/15 CTest entries passed | ASan, UBSan and `-Werror` |
+| macOS / AppleClang | 14/14 CTest entries passed | ASan and UBSan |
+| x86_64 Debian VM / GCC 14.2.0 | 16/16 CTest entries passed | ASan, UBSan and `-Werror` |
 
 The portable suite covers core parsing/arithmetic, history ownership, CPU analysis,
-attribution, IPC, CLI help and invalid arguments. New fixtures cover fractional
+attribution, context evidence, IPC, CLI help and invalid arguments. New fixtures cover fractional
 query clipping, stale windows, full-event versus query-window totals, endpoint
-privacy, malformed requests, duplicate recorders, stale sockets and slow or
+privacy, malformed requests, duplicate recorders, endpoint restart and slow or
 disconnected clients. Linux also runs live lifecycle and recorder/query tests,
-including continued sampling between queries and cleanup on shutdown. Formatting
+including continued sampling between queries and shutdown. Linux IPC fixtures
+add SIGKILL/rebind checks and assert that no runtime socket or lock was created. Formatting
 of edited C files and repository-local Markdown links were checked.
 See [CONTRIBUTING.md](../CONTRIBUTING.md#build-and-test) to reproduce the suite.
 
@@ -235,10 +273,10 @@ GCC/Clang and macOS Clang; hosted CI results have not been verified here.
 
 ## Remaining work
 
-1. Expand contextual explanations, including ancestor views and lifecycle timing
-   correlations, while preserving polling uncertainty.
-2. Benchmark recording overhead, query latency and retention under larger process
+1. Benchmark recording overhead, query latency and retention under larger process
    populations before optimizing the synchronous query renderer.
+2. Add explicit opt-in query metadata expansion with observation timestamps and
+   privacy-preserving defaults.
 
 There is no persistent recording format or restart recovery. The current build
 is a development checkpoint, not a completed v0.1 release. Each stage should add

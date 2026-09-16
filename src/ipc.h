@@ -3,8 +3,10 @@
 #include "history.h"
 #include <signal.h>
 
-/* One same-UID client at a time. Sockets and response buffers are bounded;
- * history is borrowed only synchronously while rendering a response. */
+/* Linux uses a filesystem-free abstract endpoint; macOS pathname transport
+ * currently exists for portable tests only. One same-UID client at a time.
+ * Sockets and response buffers are bounded; history is borrowed only
+ * synchronously while rendering a response. */
 typedef struct WhyServer WhyServer;
 WhyServer *why_server_open(void);
 void why_server_close(WhyServer *server);

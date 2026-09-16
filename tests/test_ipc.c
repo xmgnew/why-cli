@@ -1,6 +1,7 @@
 #include "ipc.h"
 #include <errno.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,8 +49,17 @@ static int connect_client(void) {
 	struct sockaddr_un address = {0};
 	address.sun_family = AF_UNIX;
 	CHECK(strlen(socket_name) < sizeof address.sun_path);
+#ifdef __linux__
+	snprintf(address.sun_path + 1, sizeof address.sun_path - 1,
+			 "why-cli.%lu.%s", (unsigned long)geteuid(),
+			 getenv("WHY_SOCKET_NAME"));
+	socklen_t length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 +
+								   strlen(address.sun_path + 1));
+#else
 	strcpy(address.sun_path, socket_name);
-	CHECK(connect(fd, (struct sockaddr *)&address, sizeof address) == 0);
+	socklen_t length = sizeof address;
+#endif
+	CHECK(connect(fd, (struct sockaddr *)&address, length) == 0);
 	struct timeval timeout = {.tv_sec = 5};
 	CHECK(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout) ==
 		  0);
@@ -128,6 +138,12 @@ int main(void) {
 	CHECK(strlen(directory) + strlen("/recorder.sock") < sizeof socket_name);
 	strcpy(socket_name, directory);
 	strcat(socket_name, "/recorder.sock");
+#ifdef __linux__
+	CHECK(setenv("WHY_SOCKET_NAME", template, 1) == 0);
+	CHECK(setenv("WHY_SOCKET_NAME", "invalid/name", 1) == 0);
+	CHECK(!why_server_open() && errno == EINVAL);
+	CHECK(setenv("WHY_SOCKET_NAME", template, 1) == 0);
+#else
 	CHECK(chmod(directory, 0755) == 0);
 	CHECK(!why_server_open() && errno == EACCES);
 	CHECK(chmod(directory, 0700) == 0);
@@ -137,10 +153,15 @@ int main(void) {
 	CHECK(fclose(file) == 0);
 	CHECK(!why_server_open() && errno == EACCES);
 	CHECK(unlink(socket_name) == 0);
+#endif
 	pid_t child = start_server(true);
 	finish(child, false);
 	struct stat st;
+#ifdef __linux__
+	CHECK(lstat(socket_name, &st) < 0 && errno == ENOENT);
+#else
 	CHECK(lstat(socket_name, &st) == 0 && S_ISSOCK(st.st_mode));
+#endif
 	child = start_server(false);
 	CHECK(
 		!why_server_open()); /* Duplicate process cannot steal the endpoint. */
@@ -158,12 +179,27 @@ int main(void) {
 	close(gone);
 	exchange(request, sizeof request - 1, "Recorder is warming up");
 	CHECK(why_client_query(60) == 0);
+#ifdef __linux__
+	CHECK(kill(child, SIGKILL) == 0);
+	int killed_status;
+	CHECK(waitpid(child, &killed_status, 0) == child);
+	active_child = 0;
+	CHECK(WIFSIGNALED(killed_status) && WTERMSIG(killed_status) == SIGKILL);
+	child =
+		start_server(false); /* Kernel releases the endpoint after SIGKILL. */
+	exchange(request, sizeof request - 1, "WHY/1 END\n");
+#endif
 	finish(child, true);
 	CHECK(lstat(socket_name, &st) < 0 && errno == ENOENT);
 	CHECK(why_client_query(60) == 1);
 	char lock[1200];
 	snprintf(lock, sizeof lock, "%s.lock", socket_name);
+#ifdef __linux__
+	CHECK(lstat(lock, &st) < 0 && errno == ENOENT);
+	/* rmdir proves no unexpected runtime entries were created. */
+#else
 	CHECK(unlink(lock) == 0);
+#endif
 	CHECK(rmdir(directory) == 0);
 	puts("IPC privacy, framing, duplicate recorder, stale socket, disconnect "
 		 "and timeout tests passed.");

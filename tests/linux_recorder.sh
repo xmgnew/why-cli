@@ -2,7 +2,8 @@
 # Every runtime file stays in this test's build-directory fixture.
 set -eu
 scratch=$(mktemp -d why-recorder-XXXXXX)
-export WHY_RUNTIME_DIR="$PWD/$scratch/runtime"
+export WHY_SOCKET_NAME="$scratch"
+export WHY_RUNTIME_DIR="$PWD/$scratch/must-not-be-created"
 recorder=
 cleanup() {
     if [ -n "$recorder" ]; then
@@ -19,7 +20,7 @@ trap 'exit 1' HUP INT TERM
 "$1" watch > "$scratch/watch" 2>&1 &
 recorder=$!
 i=0
-until [ -S "$WHY_RUNTIME_DIR/recorder.sock" ]; do
+until "$1" > "$scratch/query" 2> "$scratch/error"; do
     kill -0 "$recorder"
     i=$((i + 1))
     [ "$i" -lt 10 ]
@@ -45,7 +46,7 @@ second_end=$(sed -n 's/^Query window: [0-9.]*\.\.\([0-9.]*\) monotonic.*/\1/p' "
 kill "$recorder"
 wait "$recorder"
 recorder=
-[ ! -e "$WHY_RUNTIME_DIR/recorder.sock" ]
+[ ! -e "$WHY_RUNTIME_DIR" ]
 if "$1" > "$scratch/error" 2>&1; then
     echo 'Query unexpectedly succeeded without recorder' >&2
     exit 1

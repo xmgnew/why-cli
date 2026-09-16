@@ -39,7 +39,8 @@ int main(int argc, char **argv) {
 			 "watch: foreground Linux recorder; Ctrl-C stops and releases "
 			 "history.\n"
 			 "Queries: last 60 seconds by default; Ns accepts 1s..300s.\n"
-			 "Runtime: private $XDG_RUNTIME_DIR/why-cli or $WHY_RUNTIME_DIR.\n"
+			 "Linux IPC: no runtime files; optional WHY_SOCKET_NAME selects a "
+			 "session.\n"
 			 "sample: diagnostic 1-second sampling, default count 2.\n"
 			 "--details displays arguments, cwd and executable; --history adds "
 			 "lifecycle output.\n"
@@ -123,7 +124,7 @@ int main(int argc, char **argv) {
 	if (watch && !server) {
 		fprintf(stderr,
 				"Cannot start recorder: %s. Check for an existing watch and "
-				"use a private runtime directory.\n",
+				"check WHY_SOCKET_NAME.\n",
 				strerror(errno));
 		why_history_destroy(history);
 		why_frame_destroy(&frames[0]);

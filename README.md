@@ -9,7 +9,8 @@ observed processes contributed to an increase in CPU use.
 **Status: early Linux prototype.** Process sampling, metadata, lifecycle
 observations, bounded history, CPU spike detection, and contributor rankings
 work today, including a foreground recorder and cross-terminal queries.
-Contextual explanations and performance validation are still in development.
+Historical parent chains and conservative lifecycle timing evidence are available;
+performance validation and optional query detail expansion remain in development.
 
 ## Try it
 
@@ -35,15 +36,12 @@ Leave `watch` running, then open another terminal in the repository:
 ./build/why 300s        # Query up to five minutes of retained history
 ```
 
-Both terminals must use the same private runtime directory. By default this is
-`$XDG_RUNTIME_DIR/why-cli`. If your session has no `XDG_RUNTIME_DIR`, set an explicit
-path in both terminals before starting either command:
+On Linux, both terminals connect through a same-user abstract Unix socket. There
+is no runtime directory, socket file or lock file. For multiple independent
+recorders, set the same `WHY_SOCKET_NAME` in each matching pair of terminals
+(for example `export WHY_SOCKET_NAME=experiment`).
 
-```sh
-export WHY_RUNTIME_DIR="$PWD/build/why-runtime"
-```
-
-The recorder creates that directory with private permissions. It runs in the
+It runs in the
 foreground; Ctrl-C stops it and releases all recorded history. Queries report the
 actual available window, total CPU rankings and overlapping spike events. Allow
 at least eleven samples to establish a baseline, followed by additional samples
@@ -71,11 +69,14 @@ fixture tests, but does not support live sampling yet. See the
 - Baseline-based CPU spike summaries with recovery and interruption states.
 - Separate total and incremental CPU rankings, with conservative sibling grouping.
 - Time-aligned estimates of observed process CPU, without extrapolating missing data.
+- Historical parent chains and lifecycle timing evidence, without causal claims.
 - Same-user local queries while the foreground recorder continues sampling.
 - Explicit diagnostics for missing data, partial scans, timing gaps, and truncation.
 
 The recorder runs without root and uses procfs polling. Queries use a local Unix
-socket; there are no internet requests, recording files, or permanent daemon.
+socket; there are no internet requests, runtime files, recording files, or permanent
+daemon on Linux. The kernel releases the endpoint when its socket references close,
+including after process termination.
 Arguments are collected in memory but displayed only with `--details`; they may
 contain sensitive values. All retained history is released when the command exits.
 
@@ -101,7 +102,8 @@ the retained history.
 2. **Complete:** sampling interval alignment and sustained CPU spike detection.
 3. **Complete:** total and incremental CPU contributor ranking with explicit uncertainty.
 4. **Complete:** foreground recorder and cross-terminal CPU queries.
-5. **Next:** richer contextual explanations and workload performance validation.
+5. **Complete:** bounded historical parent chains and conservative lifecycle correlations.
+6. **Next:** workload performance validation and optional query detail expansion.
 
 Memory, disk, network, a TUI, and live macOS support are outside the current scope.
 
