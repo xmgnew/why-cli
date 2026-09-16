@@ -3,13 +3,13 @@
 ## Current status
 
 The collector, metadata/history, interval alignment, CPU spike detection, and
-contributor ranking milestones are implemented. The recorder/query interface in
-the [v0.1 specification](v0.1-spec.md) is still pending; the build version `0.1.0`
-still denotes development work.
+contributor ranking and foreground recorder/query milestones are implemented.
+The [v0.1 specification](v0.1-spec.md) remains the design target; richer context
+and performance validation are pending. Version `0.1.0` denotes development work.
 
-The command currently available is `why sample`. It provides a diagnostic view
-with an optional lifecycle timeline, CPU spike summaries, and total/incremental
-contributor rankings.
+`why watch` records in the foreground; `why`, `why Ns`, and `why cpu [Ns]` query
+its retained CPU history from another terminal. `why sample` remains available
+for per-sample diagnostics and optional metadata/lifecycle output.
 
 ## Code map
 
@@ -24,7 +24,11 @@ contributor rankings.
 | `tests/test_cpu_analysis.c` | Alignment, confirmation, recovery, gap and history integration fixtures. |
 | `src/attribution.h`, `src/attribution.c` | Bounded identity aggregation, baseline rates, sibling grouping, rankings and quality gates. |
 | `tests/test_attribution.c` | Total/increment separation, grouping, clipping, unknown baselines and quality regressions. |
-| `src/main.c` | CLI options, sampling cadence, escaped diagnostic output. |
+| `src/main.c` | CLI options, signals, sampling cadence and recorder lifetime. |
+| `src/report.h`, `src/report.c` | Escaped diagnostic and query presentation to an explicit output stream. |
+| `src/ipc.h`, `src/ipc.c` | Private runtime endpoint, recorder lock, peer checks, bounded nonblocking request/response I/O. |
+| `tests/test_ipc.c` | Runtime permissions, request framing, duplicate/stale endpoints, disconnects and timeouts. |
+| `tests/linux_recorder.sh` | Live watch/query, continued sampling and shutdown integration. |
 | `tests/test_core.c` | Parser, CPU, identity, clock and collector integration fixtures. |
 | `tests/test_history.c` | Metadata, ownership, lifecycle and retention regressions. |
 | `tests/linux_lifecycle.sh` | Linux-only live process appearance/disappearance test. |
@@ -37,7 +41,7 @@ procfs reads → typed observations → bounded history + lifecycle observations
              adjacent CPU deltas     spike detection
                                            ↓
                               aligned contributor rankings
-                     └──────── diagnostic CLI ────────┘
+                     └──── reports to stdout / Unix socket ────┘
 ```
 
 Core tests can use synthetic counters or a temporary procfs-shaped directory.
@@ -110,13 +114,18 @@ internal history views are borrowed and may become invalid on the next append.
 | History quota | 48 MiB |
 | Attribution reservation | 16 MiB, including scratch arrays |
 | Attribution identities | 32768 |
+| IPC request buffer | 32 bytes |
+| IPC response buffer | 64 KiB per endpoint |
+| Simultaneously serviced query connections | 1; listen backlog 4 |
+| Full incidents shown per query | Latest 8 overlapping incidents |
 
 The history quota includes history structures, both fixed tracking arrays,
 event/frame allocations, and metadata reference charges. Shared metadata is
 conservatively charged per snapshot reference, so quota eviction can happen before
 physical allocation reaches that amount. Oversized snapshots fail explicitly.
 The collector's two working arrays, context allocations and read scratch are
-separately bounded; the recording quota is not a total-process RSS limit.
+separately bounded, as are the fixed IPC buffers; the recording quota is not a
+total-process RSS limit.
 
 System parsing currently requires ten CPU accounting columns through `guest_nice`.
 Unsupported or truncated input fails explicitly. These are prototype limits, not
@@ -167,19 +176,56 @@ slow/partial scans, baseline gaps, eviction, empty measurements and capacity lim
 Direct parent identity is shown; ancestor rollups and automatic lifecycle-based
 explanations are still pending. Performance targets have not been benchmarked.
 
+## Foreground recorder and query transport
+
+The foreground process owns both reusable collection frames and history. Between
+absolute sampling deadlines it polls a Unix stream socket. Accepted sockets use
+nonblocking I/O; one client is serviced at a time and has a two-second deadline.
+A disconnect cannot terminate the process through SIGPIPE. Query rendering borrows
+history synchronously, destroys attribution results, then sends owned text from a
+fixed 64 KiB buffer. No history pointer survives into asynchronous socket writes.
+Rendering can still delay the next sample; missed intervals remain discontinuities.
+This is not a latency or throughput guarantee under heavy query load.
+
+Runtime lookup uses `WHY_RUNTIME_DIR` or `$XDG_RUNTIME_DIR/why-cli`. The final
+directory must be private and owned by the effective UID; final symlinks are
+rejected. The XDG parent is also checked when used. A non-symlink, private regular
+lock file is held with an advisory write lock for the recorder lifetime. Only
+its owner may remove a stale socket after acquiring that lock. Normal shutdown
+unlinks the socket before releasing the lock; the empty lock file remains to
+avoid creating competing lock inodes. Neither endpoint accepts a different UID:
+Linux uses `SO_PEERCRED`, and portable macOS IPC fixtures use `getpeereid`.
+
+The internal versioned protocol is one canonical ASCII request, `WHY/1 N\n`,
+where N is 1..300. Responses use `WHY/1 OK\n`, bounded report text, and a final
+`WHY/1 END\n`; failures use `WHY/1 ERROR\n`. The client waits at most five seconds
+for a response, verifies framing, and rejects truncated or oversized replies.
+This protocol is internal, not a stable recording or third-party integration API.
+No raw C structs, process arguments or cwd fields are transferred.
+
+The requested window begins at query time minus N seconds and ends at the latest
+retained system observation. Missing prefixes and observation age are printed.
+Window totals use the explicit-window attribution entry point without inventing
+a baseline. Overlapping incident results retain their original baseline and full
+event boundaries, are labeled separately, and never get summed into window totals.
+Only eight latest overlapping incidents are rendered, with omissions counted.
+
 ## Validation
 
-Latest completed validation at the attribution milestone (2026-09-15):
+Latest completed validation at the recorder/query milestone (2026-09-16):
 
 | Environment | Result | Checks |
 |---|---|---|
-| macOS / AppleClang | 6/6 CTest entries passed | ASan and UBSan |
-| x86_64 Debian VM / GCC 14.2.0 | 7/7 CTest entries passed | ASan, UBSan and `-Werror` |
+| macOS / AppleClang | 13/13 CTest entries passed | ASan and UBSan |
+| x86_64 Debian VM / GCC 14.2.0 | 15/15 CTest entries passed | ASan, UBSan and `-Werror` |
 
 The portable suite covers core parsing/arithmetic, history ownership, CPU analysis,
-attribution, CLI help and invalid arguments. Linux also runs a controlled live
-process-lifecycle test. Live smoke runs checked total rankings and the single-sample
-unavailable case. Formatting and repository-local Markdown links were checked.
+attribution, IPC, CLI help and invalid arguments. New fixtures cover fractional
+query clipping, stale windows, full-event versus query-window totals, endpoint
+privacy, malformed requests, duplicate recorders, stale sockets and slow or
+disconnected clients. Linux also runs live lifecycle and recorder/query tests,
+including continued sampling between queries and cleanup on shutdown. Formatting
+of edited C files and repository-local Markdown links were checked.
 See [CONTRIBUTING.md](../CONTRIBUTING.md#build-and-test) to reproduce the suite.
 
 These results are regression and smoke checks, not a performance study. QEMU runs
@@ -189,11 +235,10 @@ GCC/Clang and macOS Clang; hosted CI results have not been verified here.
 
 ## Remaining work
 
-1. Add the foreground recorder and cross-terminal query interface. `why watch`,
-   `why cpu` and `why 60s` remain planned commands.
-2. Expand contextual explanations, including ancestor views and lifecycle timing
+1. Expand contextual explanations, including ancestor views and lifecycle timing
    correlations, while preserving polling uncertainty.
-3. Benchmark recording overhead and retention under larger process populations.
+2. Benchmark recording overhead, query latency and retention under larger process
+   populations before optimizing the synchronous query renderer.
 
 There is no persistent recording format or restart recovery. The current build
 is a development checkpoint, not a completed v0.1 release. Each stage should add

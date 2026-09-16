@@ -10,9 +10,13 @@ Use `./build/why` directly; installing it is not required. Linux needs a readabl
 `/proc` with modern CPU accounting fields through `guest_nice`.
 
 ```text
+why watch
+why [cpu] [Ns]
 why sample [--count N] [--details] [--history]
 why --help
 ```
+
+The following options apply to `sample` (apart from top-level `--help`):
 
 | Option | Behavior |
 |---|---|
@@ -27,8 +31,62 @@ than fabricating samples. For example, ten samples usually span about nine secon
 plus collection time. `--count 1` cannot produce an adjacent-sample CPU rate.
 
 History is collected with or without `--history`; that flag controls the timeline
-printed at the end. Ctrl-C or SIGTERM requests a graceful stop. There is no
-cross-terminal access, recording-file format, or restart recovery yet.
+printed at the end. Ctrl-C or SIGTERM requests a graceful stop. `sample` is
+self-contained and does not expose its history to other terminals. There is no
+recording-file format or restart recovery.
+
+## Foreground recording and cross-terminal queries
+
+Start `why watch` on Linux and leave it running. It records at a nominal one-second
+cadence without printing every process table. In another terminal, use `why`,
+`why cpu`, `why 60s`, or `why cpu 30s`. Queries default to 60 seconds; the accepted
+range is `1s` through `300s`. Queries return a snapshot and exit. `watch` and query
+commands do not accept `sample` options such as `--details` or `--history`.
+
+The default runtime directory is `$XDG_RUNTIME_DIR/why-cli`. The XDG directory must
+exist, belong to the current user and exclude group/other permissions. To use an
+explicit directory, set `WHY_RUNTIME_DIR` to the same absolute path in both
+terminals. For a repository-local session:
+
+```sh
+export WHY_RUNTIME_DIR="$PWD/build/why-runtime"
+./build/why watch
+# In another terminal, set the same variable, then run ./build/why
+```
+
+The recorder creates the final directory with mode 0700 if needed; its parent must
+already exist. Existing final directories must be private, owned by the current
+user and not symlinks. Paths must fit the platform's Unix socket path limit.
+There is no automatic fallback to a shared temporary or home directory. Both
+peers verify that the other endpoint has the same effective UID.
+
+Only one recorder may own a runtime directory. Ctrl-C/SIGTERM releases history and
+removes the socket. A small empty lock file and its directory remain for safe
+coordination across restarts; neither contains recording data. After a crash, the
+next recorder can replace its stale socket while holding the lock. Do not manually
+remove a live recorder's lock file. Restarting always begins a new recording.
+
+Query output includes:
+
+- The requested duration, actual monotonic window and latest-observation age.
+  Unavailable prefixes and empty/stale windows are explicit.
+- Whole-machine average CPU weighted by valid interval duration, sampled peak,
+  and total contributor rankings clipped to the query window. Gaps remain unknown.
+- Up to eight latest overlapping spikes, explicitly labeled **full event** results.
+  Their baselines and increments cover the original event, which may extend outside
+  the query window. They are not added to query-window totals. Omitted older events
+  are counted.
+
+A query ends at the latest retained system observation; it never extrapolates up
+to the present. With only one sample, there is no comparable interval yet. An old
+active-event aggregate does not make expired raw observations available again.
+
+The recorder serves one connection at a time with nonblocking socket I/O, a small
+backlog and a two-second connection deadline. Clients have a five-second response
+deadline. Oversized or malformed requests are rejected; incomplete responses fail
+instead of being treated as complete results. Rendering still runs synchronously
+between samples, so heavy analysis can delay sampling; resulting gaps remain
+visible. Query load and large-process performance are not benchmarked yet.
 
 ## Reading CPU output
 
@@ -80,7 +138,8 @@ evict whole old snapshots. Events from before the retained window are unavailabl
 
 ## CPU spike summaries
 
-Sampling ends with a whole-machine CPU spike summary, even without `--history`.
+`sample` ends with a whole-machine CPU spike summary, even without `--history`.
+Recorder queries show spikes overlapping their requested window.
 At least ten valid CPU intervals are needed to establish a baseline (eleven raw
 samples). The detector uses up to thirty prior non-event intervals:
 
@@ -157,7 +216,7 @@ intervals remain unavailable, not measured zero. These are contribution estimate
 not proof of causality or a complete account of short-lived processes.
 
 History uses up to 48 MiB, with another 16 MiB reserved for bounded analysis within
-the 64 MiB recording/analysis budget. Collector buffers are separately bounded;
+the 64 MiB recording/analysis budget. Collector and IPC buffers are separately bounded;
 this is not an RSS limit. Reaching the analysis identity cap is reported explicitly.
 
 ## Context and privacy
@@ -173,8 +232,9 @@ Empty fields, missing paths, permission failures, and failed identity checks are
 reported separately. Cached context is labeled with its observation time.
 
 Arguments are collected even without `--details`, but remain hidden in default
-output. The recorder does not read the process environment or transmit collected
-data. Shell redirection can persist output, so review it before sharing logs,
+output. The recorder does not read monitored process environments. Queries send
+summary text only through the same-user local socket; arguments and cwd are not
+exposed by the current query interface. Shell redirection can persist output, so review it before sharing logs,
 especially when `--details` is enabled.
 
 ## Troubleshooting
@@ -182,6 +242,9 @@ especially when `--details` is enabled.
 | Message or symptom | What to check |
 |---|---|
 | Live collection requires Linux | macOS supports fixture tests only. Run live sampling on Linux. |
+| Cannot query recorder | Start `why watch` and use the same runtime directory in both terminals. There is no history after watch exits. |
+| Cannot start recorder | Check for an existing recorder, directory ownership/permissions, and Unix socket path length. |
+| Query timeout | Retry after a slow scan or query completes. Large workloads and query load are not benchmarked yet. |
 | Cannot collect `/proc` | Check procfs availability and access in the current environment. Unsupported or malformed system input is rejected. |
 | Permission-denied fields | Some process information is restricted. Available CPU observations still remain useful; missing context is not fabricated. |
 | Scan exceeds 200 ms | Timing quality is degraded. A slow VM or many processes can increase scan time; this is not a demonstrated performance target. |

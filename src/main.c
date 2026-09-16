@@ -1,4 +1,5 @@
-#include "attribution.h"
+#include "ipc.h"
+#include "report.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -11,426 +12,180 @@
 
 static volatile sig_atomic_t stopped;
 static void stop(int signal_number) {
-    (void)signal_number;
-    stopped = 1;
+	(void)signal_number;
+	stopped = 1;
 }
 
-static void escaped_bytes(const unsigned char *text, size_t length) {
-    for (const unsigned char *p = text; p < text + length; ++p) {
-        if (*p < 32 || *p >= 127 || *p == '\\')
-            printf("\\x%02x", (unsigned)*p);
-        else
-            putchar(*p);
-    }
-}
-
-static void escaped(const char *text) {
-    escaped_bytes((const unsigned char *)text, strlen(text));
-}
-
-static const char *field_status(WhyFieldStatus status) {
-    switch (status) {
-    case WHY_FIELD_OK:
-        return "available";
-    case WHY_FIELD_EMPTY:
-        return "empty";
-    case WHY_FIELD_MISSING:
-        return "missing";
-    case WHY_FIELD_DENIED:
-        return "permission denied";
-    case WHY_FIELD_ERROR:
-        return "read error";
-    case WHY_FIELD_UNVERIFIED:
-        return "identity recheck failed";
-    case WHY_FIELD_BUDGET:
-        return "metadata budget reached";
-    }
-    return "unknown";
-}
-
-static void display_metadata(const WhyProcess *p) {
-    if (!p->metadata) {
-        printf("  Context: unavailable (%s)\n",
-               field_status(p->metadata_status));
-        return;
-    }
-    const char *names[] = {"Arguments (NUL-separated)", "Working directory",
-                           "Executable"};
-    printf("  Context observed at monotonic %.3f s\n",
-           (double)p->metadata->end_ns / (double)WHY_SECOND);
-    for (size_t i = 0; i < WHY_METADATA_FIELDS; ++i) {
-        const WhyMetadataField *f = &p->metadata->fields[i];
-        printf("  %s: ", names[i]);
-        if (f->status == WHY_FIELD_OK)
-            escaped_bytes(p->metadata->data + f->offset, f->length);
-        else
-            printf("[%s]", field_status(f->status));
-        if (f->truncated)
-            printf(" [truncated]");
-        putchar('\n');
-    }
-}
-
-static void display_history(const WhyHistory *history, bool timeline) {
-    WhyHistoryStats stats = why_history_stats(history);
-    printf("\nHistory: %zu frames, %.1f seconds, %zu / %zu charged bytes; "
-           "%zu evicted, %zu untracked observations\n",
-           stats.frames,
-           stats.frames ? (double)(stats.newest_ns - stats.oldest_ns) /
-                              (double)WHY_SECOND
-                        : 0,
-           stats.bytes, stats.budget, stats.evicted_frames,
-           stats.tracking_dropped);
-    if (!timeline)
-        return;
-    puts("Recorded lifecycle observations (monotonic seconds; disappearance is "
-         "not an exact exit):");
-    for (const WhyHistoryEntry *entry = why_history_first(history); entry;
-         entry = entry->next) {
-        if (entry->tracking_dropped)
-            printf(
-                "  %zu new observations could not be tracked in this frame\n",
-                entry->tracking_dropped);
-        if (entry->sampling_gap)
-            printf("  %.3f  sampling gap\n",
-                   (double)entry->frame.end_ns / (double)WHY_SECOND);
-        for (size_t i = 0; i < entry->event_count; ++i) {
-            const WhyLifecycle *event = &entry->events[i];
-            printf("  %.3f..%.3f  %u:%" PRIu64 "  %s\n",
-                   (double)event->earliest_ns / (double)WHY_SECOND,
-                   (double)event->latest_ns / (double)WHY_SECOND,
-                   event->identity.pid, event->identity.start_ticks,
-                   why_lifecycle_name(event->type));
-        }
-    }
-}
-
-static void display_rank(const WhyAttribution *r, bool increment) {
-    printf("    %s (CPU seconds):\n", increment ? "Increase above own baseline"
-                                                : "Total observed activity");
-    double shown = 0;
-    for (size_t j = 0; j < r->count && j < 3; ++j) {
-        size_t i = increment ? r->increment_order[j] : j;
-        const WhyContributor *row = &r->rows[i];
-        printf("      %zu. ", j + 1);
-        if (row->context)
-            escaped(row->context->comm);
-        else
-            printf("PID %u", row->identity.pid);
-        if (row->members > 1)
-            printf(" x %zu%s", row->members,
-                   row->weak_group ? " [name-based group]" : "");
-        else
-            printf(" [%u:%" PRIu64 "]", row->identity.pid,
-                   row->identity.start_ticks);
-        printf("  total=%.3f", row->cpu_seconds);
-        if (r->end_ns > r->start_ns)
-            printf("  avg_cores=%.3f", row->cpu_seconds * (double)WHY_SECOND /
-                                           (double)(r->end_ns - r->start_ns));
-        if (!row->context_stable)
-            printf(" [context changed; kept separate]");
-        if (r->has_baseline) {
-            if (row->baseline_known)
-                printf("  increase=%.3f", row->excess_seconds);
-            else
-                printf("  increase=unknown/partial");
-        }
-        if (row->context && row->context->parent_known)
-            printf("  observed parent=%u:%" PRIu64, row->context->parent.pid,
-                   row->context->parent.start_ticks);
-        if (row->identity.pid == (uint32_t)getpid())
-            printf(" [why recorder]");
-        if (row->likely)
-            printf(" [primary observed CPU increase contributor]");
-        putchar('\n');
-        shown += row->cpu_seconds;
-    }
-    if (r->count > 3)
-        printf("      Other %zu rows: %.3f total CPU seconds\n", r->count - 3,
-               r->process_seconds - shown);
-    if (!r->count)
-        puts("      No measurable process CPU in this window.");
-}
-
-static void display_attribution(const WhyHistory *history,
-                                const WhyCpuIncident *event, long hz) {
-    WhyAttribution *r =
-        why_attribute(history, event, hz, WHY_ATTRIBUTION_CAPACITY);
-    if (!r) {
-        puts("    Contributor analysis unavailable (insufficient observations "
-             "or allocation failure).");
-        return;
-    }
-    if (event)
-        display_rank(r, true);
-    display_rank(r, false);
-    if (r->system_covered_seconds <= 0)
-        puts("    No comparable system intervals: CPU totals are unavailable, "
-             "not measured zero.");
-    else
-        printf("    Comparable retained CPU: system=%.3f, processes=%.3f, "
-               "signed residual=%.3f seconds\n",
-               r->system_seconds, r->process_seconds, r->residual_seconds);
-    if (r->system_seconds > 0)
-        printf("    Accounting ratio=%.1f%%; observed-time coverage=%.1f%%\n",
-               100 * r->accounted_ratio, 100 * r->coverage_ratio);
-    size_t unknown_rows = 0;
-    for (size_t i = 0; i < r->count; ++i)
-        if (!r->rows[i].baseline_known)
-            ++unknown_rows;
-    if (event && unknown_rows)
-        printf("    %zu rows have unknown/partial increment baselines.\n",
-               unknown_rows);
-    if (r->issues &&
-        (event || (r->issues & ~(unsigned)WHY_ATTR_UNKNOWN_BASELINE))) {
-        puts(event ? "    Primary-contributor label withheld:"
-                   : "    Ranking limitations:");
-        const struct {
-            unsigned bit;
-            const char *text;
-        } reasons[] = {
-            {WHY_ATTR_PROVISIONAL, "event ongoing or interrupted"},
-            {WHY_ATTR_TRUNCATED, "baseline/event history incomplete"},
-            {WHY_ATTR_GAP, "system sampling gap"},
-            {WHY_ATTR_PARTIAL_SCAN, "partial scan or lifecycle tracking"},
-            {WHY_ATTR_SLOW_SCAN, "scan exceeds 200 ms"},
-            {WHY_ATTR_LOW_COVERAGE, "less than 90% observed-time coverage"},
-            {WHY_ATTR_ACCOUNTING,
-             "CPU accounting outside 80–105% or undefined"},
-            {WHY_ATTR_UNKNOWN_BASELINE, "insufficient per-process baselines"},
-            {WHY_ATTR_CAPACITY, "analysis identity capacity reached"}};
-        for (size_t i = 0; i < sizeof reasons / sizeof *reasons; ++i)
-            if ((event || reasons[i].bit != WHY_ATTR_UNKNOWN_BASELINE) &&
-                (r->issues & reasons[i].bit))
-                printf("      %s\n", reasons[i].text);
-    }
-    if (r->dropped)
-        printf("    %zu observations omitted at the identity cap.\n",
-               r->dropped);
-    puts("    Residual includes missing observations and accounting "
-         "differences; this is not proof of causality.");
-    why_attribution_destroy(r);
-}
-
-static void display_incident(const WhyHistory *history,
-                             const WhyCpuIncident *event, long hz) {
-    const char *status = event->status == WHY_INCIDENT_RECOVERED ? "recovered"
-                         : event->status == WHY_INCIDENT_INTERRUPTED
-                             ? "interrupted"
-                             : "ongoing (provisional)";
-    printf(
-        "  CPU spike %.3f..%.3f s: %s; baseline %.1f%%, sampled peak %.1f%%\n",
-        (double)event->start_ns / (double)WHY_SECOND,
-        (double)event->end_ns / (double)WHY_SECOND, status, event->baseline_pct,
-        event->peak_pct);
-    printf("    Peak interval %.3f..%.3f s; system CPU %.3f seconds\n",
-           (double)event->peak_start_ns / (double)WHY_SECOND,
-           (double)event->peak_end_ns / (double)WHY_SECOND, event->cpu_seconds);
-    display_attribution(history, event, hz);
-}
-
-static void display_spikes(const WhyHistory *history, long hz) {
-    puts("\nCPU spike analysis (whole-machine CPU; sampled intervals):");
-    size_t count = 0;
-    for (const WhyHistoryEntry *entry = why_history_first(history); entry;
-         entry = entry->next) {
-        if (entry->incident_completed) {
-            display_incident(history, &entry->incident, hz);
-            ++count;
-        }
-    }
-    const WhyCpuDetector *detector = why_history_detector(history);
-    WhyCpuIncident current;
-    if (why_detector_current(detector, &current)) {
-        display_incident(history, &current, hz);
-        ++count;
-    }
-    if (!count)
-        puts("  No confirmed CPU spike in retained summaries; this does not "
-             "rule out other problems.");
-    if (detector->state == WHY_WARMUP)
-        printf("  Baseline warming up: %zu/%u valid intervals.\n",
-               detector->baseline_count, WHY_BASELINE_MIN);
-    if (detector->state == WHY_CANDIDATE)
-        puts("  One high interval observed; waiting for confirmation.");
-    if (!count)
-        display_attribution(history, NULL, hz);
-}
-
-static void display(const WhyFrame *previous, const WhyFrame *current, long hz,
-                    size_t sequence, bool details) {
-    bool gap = previous && why_frame_discontinuity(previous, current);
-    WhyCpu system = why_system_cpu(previous ? &previous->system : NULL,
-                                   &current->system, hz);
-    if (gap)
-        system.validity = WHY_CLOCK_GAP;
-    printf("\nSample %zu | %zu visible entries | scan %.2f ms\n", sequence,
-           current->count, (double)(current->end_ns - current->begin_ns) / 1e6);
-    if (system.validity == WHY_OK)
-        printf("System CPU: %.1f%% busy (whole machine), %.3f CPU seconds\n",
-               system.busy_pct, system.cpu_seconds);
-    else
-        printf("System CPU: unavailable (%s)\n",
-               why_validity_name(system.validity));
-    printf("Scan: %s; skipped=%zu gone=%zu denied=%zu malformed=%zu I/O "
-           "errors=%zu\n",
-           current->complete ? "complete" : "partial", current->skipped,
-           current->gone, current->denied, current->malformed,
-           current->io_errors);
-    if (current->metadata_skipped)
-        printf("Context unavailable for %zu readable processes.\n",
-               current->metadata_skipped);
-    if (current->end_ns - current->begin_ns > WHY_SECOND / 5)
-        puts("Timing quality: scan exceeds 200 ms; attribution would be "
-             "degraded.");
-    puts("PID\tPPID\tSTART_TICKS\tCPU_SECONDS\tCORES\tSTATE\tPARENT_"
-         "ID\tCOMMAND");
-    for (size_t i = 0; i < current->count; ++i) {
-        const WhyProcess *p = &current->processes[i];
-        if (p->status != WHY_READ_OK)
-            continue;
-        const WhyProcess *old =
-            previous ? why_find_process(previous, p->id.pid) : NULL;
-        WhyCpu cpu = why_process_cpu(old, p, hz);
-        if (gap || system.validity == WHY_TOPOLOGY_CHANGED)
-            cpu.validity = WHY_CLOCK_GAP;
-        printf("%u\t%u\t%" PRIu64 "\t", p->id.pid, p->ppid, p->id.start_ticks);
-        if (cpu.validity == WHY_OK)
-            printf("%.3f\t%.3f\t", cpu.cpu_seconds, cpu.cores);
-        else
-            printf("n/a\tn/a\t");
-        printf("%c\t", p->state);
-        if (p->parent_known)
-            printf("%u:%" PRIu64 "\t", p->parent.pid, p->parent.start_ticks);
-        else
-            printf("unknown\t");
-        escaped(p->comm);
-        if (p->comm_truncated)
-            printf(" [name truncated]");
-        if (p->id.pid == (uint32_t)getpid())
-            printf(" [why recorder]");
-        if (cpu.validity != WHY_OK)
-            printf(" [%s]", why_validity_name(cpu.validity));
-        putchar('\n');
-        if (details)
-            display_metadata(p);
-    }
-    fflush(stdout);
+static bool query_seconds(const char *text, unsigned *seconds) {
+	char *end;
+	errno = 0;
+	unsigned long n = strtoul(text, &end, 10);
+	if (text[0] < '1' || text[0] > '9' || errno || n > 300 || strcmp(end, "s"))
+		return false;
+	*seconds = (unsigned)n;
+	return true;
 }
 
 int main(int argc, char **argv) {
-    if (argc == 2 && strcmp(argv[1], "--help") == 0) {
-        puts("Usage: why sample [--count N] [--details] [--history]\n\n"
-             "Linux process/CPU recorder prototype; 1-second sampling.\n"
-             "N includes the initial baseline sample (default: 2). Ctrl-C "
-             "stops.\n"
-             "--details displays captured arguments, cwd and executable.\n"
-             "--history displays the retained lifecycle timeline on exit.\n"
-             "History is bounded to 300 seconds / 64 MiB and disappears on "
-             "exit.\n"
-             "CPU spikes and contributor rankings are printed on exit. "
-             "Cross-terminal queries are not implemented yet.");
-        return 0;
-    }
-    if (argc < 2 || strcmp(argv[1], "sample") != 0) {
-        fprintf(stderr, "Use 'why sample [--count N] [--details] [--history]' "
-                        "or 'why --help'.\n");
-        return 2;
-    }
-    size_t count = 2;
-    bool details = false, timeline = false, have_count = false;
-    for (int i = 2; i < argc; ++i) {
-        if (!strcmp(argv[i], "--details") && !details) {
-            details = true;
-        } else if (!strcmp(argv[i], "--history") && !timeline) {
-            timeline = true;
-        } else if (!strcmp(argv[i], "--count") && !have_count && i + 1 < argc) {
-            const char *value = argv[++i];
-            char *end;
-            errno = 0;
-            unsigned long n = strtoul(value, &end, 10);
-            if (value[0] < '1' || value[0] > '9' || errno || *end ||
-                n > 1000000) {
-                fprintf(stderr, "--count must be between 1 and 1000000.\n");
-                return 2;
-            }
-            count = (size_t)n;
-            have_count = true;
-        } else {
-            fprintf(stderr, "Unknown, repeated or incomplete option: %s\n",
-                    argv[i]);
-            return 2;
-        }
-    }
+	/* A disappearing query peer must not terminate the recorder. */
+	struct sigaction ignored = {0};
+	ignored.sa_handler = SIG_IGN;
+	sigemptyset(&ignored.sa_mask);
+	sigaction(SIGPIPE, &ignored, NULL);
+	if (argc == 2 && strcmp(argv[1], "--help") == 0) {
+		puts("Usage: why watch\n"
+			 "       why [cpu] [Ns]\n"
+			 "       why sample [--count N] [--details] [--history]\n\n"
+			 "watch: foreground Linux recorder; Ctrl-C stops and releases "
+			 "history.\n"
+			 "Queries: last 60 seconds by default; Ns accepts 1s..300s.\n"
+			 "Runtime: private $XDG_RUNTIME_DIR/why-cli or $WHY_RUNTIME_DIR.\n"
+			 "sample: diagnostic 1-second sampling, default count 2.\n"
+			 "--details displays arguments, cwd and executable; --history adds "
+			 "lifecycle output.\n"
+			 "History targets 300 seconds; 48 MiB history + 16 MiB analysis "
+			 "budget.\n"
+			 "CPU spikes and rankings are estimates, not proof of causality.");
+		return 0;
+	}
+	bool watch = argc == 2 && !strcmp(argv[1], "watch");
+	bool sample = argc >= 2 && !strcmp(argv[1], "sample");
+	if (!watch && !sample) {
+		unsigned seconds = 60;
+		bool valid = argc == 1 || (argc == 2 && !strcmp(argv[1], "cpu"));
+		if (argc == 2 && strcmp(argv[1], "cpu"))
+			valid = query_seconds(argv[1], &seconds);
+		if (argc == 3 && !strcmp(argv[1], "cpu"))
+			valid = query_seconds(argv[2], &seconds);
+		if (!valid) {
+			fprintf(stderr, "Invalid command. Use 'why --help'.\n");
+			return 2;
+		}
+		return why_client_query(seconds);
+	}
+	size_t count = watch ? SIZE_MAX : 2;
+	bool details = false, timeline = false, have_count = false;
+	for (int i = 2; i < argc; ++i) {
+		if (!strcmp(argv[i], "--details") && !details) {
+			details = true;
+		} else if (!strcmp(argv[i], "--history") && !timeline) {
+			timeline = true;
+		} else if (!strcmp(argv[i], "--count") && !have_count && i + 1 < argc) {
+			const char *value = argv[++i];
+			char *end;
+			errno = 0;
+			unsigned long n = strtoul(value, &end, 10);
+			if (value[0] < '1' || value[0] > '9' || errno || *end ||
+				n > 1000000) {
+				fprintf(stderr, "--count must be between 1 and 1000000.\n");
+				return 2;
+			}
+			count = (size_t)n;
+			have_count = true;
+		} else {
+			fprintf(stderr, "Unknown, repeated or incomplete option: %s\n",
+					argv[i]);
+			return 2;
+		}
+	}
 #ifndef __linux__
-    fprintf(stderr, "Live collection requires Linux. Core tests can run on "
-                    "this platform.\n");
-    return 1;
+	fprintf(stderr, "Live collection requires Linux. Core tests can run on "
+					"this platform.\n");
+	return 1;
 #endif
-    long hz = sysconf(_SC_CLK_TCK);
-    if (hz <= 0) {
-        perror("sysconf(_SC_CLK_TCK)");
-        return 1;
-    }
-    struct sigaction action = {0};
-    action.sa_handler = stop;
-    sigemptyset(&action.sa_mask);
-    sigaction(SIGINT, &action, NULL);
-    sigaction(SIGTERM, &action, NULL);
-    WhyFrame frames[2] = {0};
-    if (!why_frame_init(&frames[0]) || !why_frame_init(&frames[1])) {
-        fprintf(stderr, "Cannot allocate bounded sample buffers.\n");
-        why_frame_destroy(&frames[0]);
-        why_frame_destroy(&frames[1]);
-        return 1;
-    }
-    WhyHistory *history = why_history_create(
-        WHY_HISTORY_SECONDS * WHY_SECOND,
-        WHY_HISTORY_BYTES - WHY_ATTRIBUTION_BYTES, WHY_MAX_PROCESSES);
-    if (!history) {
-        perror("Cannot allocate history");
-        why_frame_destroy(&frames[0]);
-        why_frame_destroy(&frames[1]);
-        return 1;
-    }
-    uint32_t cursor = 0;
-    uint64_t deadline = why_now_ns();
-    int status = 0;
-    for (size_t i = 0; i < count && !stopped; ++i) {
-        WhyFrame *current = &frames[i % 2];
-        const WhyFrame *previous = i ? &frames[(i - 1) % 2] : NULL;
-        if (!why_collect("/proc", &cursor, previous, current)) {
-            perror("Cannot collect /proc");
-            status = 1;
-            break;
-        }
-        if (!why_history_append(history, current, hz)) {
-            perror("Cannot retain sample");
-            status = 1;
-            break;
-        }
-        display(previous, current, hz, i + 1, details);
-        if (i + 1 == count)
-            break;
-        deadline += WHY_SECOND;
-        uint64_t now = why_now_ns();
-        if (now >= deadline)
-            deadline += ((now - deadline) / WHY_SECOND + 1) * WHY_SECOND;
-        while (!stopped && (now = why_now_ns()) < deadline) {
-            uint64_t remaining = deadline - now;
-            struct timespec delay = {.tv_sec = (time_t)(remaining / WHY_SECOND),
-                                     .tv_nsec = (long)(remaining % WHY_SECOND)};
-            if (nanosleep(&delay, NULL) != 0 && errno != EINTR) {
-                perror("nanosleep");
-                status = 1;
-                stopped = 1;
-            }
-        }
-    }
-    display_history(history, timeline);
-    display_spikes(history, hz);
-    why_history_destroy(history);
-    why_frame_destroy(&frames[0]);
-    why_frame_destroy(&frames[1]);
-    return status;
+	long hz = sysconf(_SC_CLK_TCK);
+	if (hz <= 0) {
+		perror("sysconf(_SC_CLK_TCK)");
+		return 1;
+	}
+	struct sigaction action = {0};
+	action.sa_handler = stop;
+	sigemptyset(&action.sa_mask);
+	sigaction(SIGINT, &action, NULL);
+	sigaction(SIGTERM, &action, NULL);
+	WhyFrame frames[2] = {0};
+	if (!why_frame_init(&frames[0]) || !why_frame_init(&frames[1])) {
+		fprintf(stderr, "Cannot allocate bounded sample buffers.\n");
+		why_frame_destroy(&frames[0]);
+		why_frame_destroy(&frames[1]);
+		return 1;
+	}
+	WhyHistory *history = why_history_create(
+		WHY_HISTORY_SECONDS * WHY_SECOND,
+		WHY_HISTORY_BYTES - WHY_ATTRIBUTION_BYTES, WHY_MAX_PROCESSES);
+	if (!history) {
+		perror("Cannot allocate history");
+		why_frame_destroy(&frames[0]);
+		why_frame_destroy(&frames[1]);
+		return 1;
+	}
+	WhyServer *server = watch ? why_server_open() : NULL;
+	if (watch && !server) {
+		fprintf(stderr,
+				"Cannot start recorder: %s. Check for an existing watch and "
+				"use a private runtime directory.\n",
+				strerror(errno));
+		why_history_destroy(history);
+		why_frame_destroy(&frames[0]);
+		why_frame_destroy(&frames[1]);
+		return 1;
+	}
+	if (watch) {
+		puts("Recording process/CPU activity. Query from another terminal with "
+			 "'why' or 'why cpu 60s'. Ctrl-C stops.");
+		fflush(stdout);
+	}
+	uint32_t cursor = 0;
+	uint64_t deadline = why_now_ns();
+	int status = 0;
+	for (size_t i = 0; i < count && !stopped; ++i) {
+		WhyFrame *current = &frames[i % 2];
+		const WhyFrame *previous = i ? &frames[(i - 1) % 2] : NULL;
+		if (!why_collect("/proc", &cursor, previous, current)) {
+			perror("Cannot collect /proc");
+			status = 1;
+			break;
+		}
+		if (!why_history_append(history, current, hz)) {
+			perror("Cannot retain sample");
+			status = 1;
+			break;
+		}
+		if (!watch)
+			why_report_sample(stdout, previous, current, hz, i + 1, details);
+		if (i + 1 == count)
+			break;
+		deadline += WHY_SECOND;
+		uint64_t now = why_now_ns();
+		if (now >= deadline)
+			deadline += ((now - deadline) / WHY_SECOND + 1) * WHY_SECOND;
+		if (watch) {
+			if (!why_server_wait(server, history, hz, deadline, &stopped)) {
+				perror("Recorder socket");
+				status = 1;
+				break;
+			}
+			continue;
+		}
+		while (!stopped && (now = why_now_ns()) < deadline) {
+			uint64_t remaining = deadline - now;
+			struct timespec delay = {.tv_sec = (time_t)(remaining / WHY_SECOND),
+									 .tv_nsec = (long)(remaining % WHY_SECOND)};
+			if (nanosleep(&delay, NULL) != 0 && errno != EINTR) {
+				perror("nanosleep");
+				status = 1;
+				stopped = 1;
+			}
+		}
+	}
+	why_server_close(server);
+	if (!watch) {
+		why_report_history(stdout, history, timeline);
+		why_report_spikes(stdout, history, hz);
+	} else
+		puts("Recorder stopped; in-memory history released.");
+	why_history_destroy(history);
+	why_frame_destroy(&frames[0]);
+	why_frame_destroy(&frames[1]);
+	return status;
 }

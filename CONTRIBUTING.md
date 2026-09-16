@@ -21,21 +21,25 @@ Clang. The default build does not enable sanitizers. Tests use explicit checks
 that remain active in Release builds.
 
 macOS runs the parser, calculation, metadata, ownership, history, spike detection
-and attribution fixtures, plus CLI argument checks.
-Linux additionally runs a live process-lifecycle test. That test needs readable
+and attribution fixtures, IPC regressions, and CLI argument checks.
+Linux additionally runs live lifecycle and recorder/query tests. They need readable
 procfs and basic POSIX shell utilities. No tests require root. Fixtures create and
-remove their files in the build working directory.
+remove their files in the build working directory. IPC tests need permission to
+bind local Unix sockets; a sandbox denial is an environment restriction, not a
+passing test. Keep test runtime directories under the build directory, and do not
+point fixtures at a live recorder.
 
 The CI matrix targets Linux GCC, Linux Clang, and macOS Clang. Distinguish a local
 successful test run from a hosted CI result that has not yet been observed.
 
 ## Style and ownership
 
-Use the LLVM-based `.clang-format`: four spaces and no tabs.
+Follow the LLVM-based `.clang-format`: indentation and tab width are four, with
+`UseTab: Always`. Format edited C files; older untouched files may still use spaces.
 
 ```sh
-clang-format -i src/*.c src/*.h tests/*.c
-clang-format --dry-run --Werror src/*.c src/*.h tests/*.c
+clang-format -i src/your_changed_file.c
+clang-format --dry-run --Werror src/your_changed_file.c
 ```
 
 Keep compiler warnings clean on GCC and Clang. Use `why_` / `Why` prefixes for

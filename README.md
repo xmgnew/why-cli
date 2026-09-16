@@ -8,7 +8,8 @@ observed processes contributed to an increase in CPU use.
 
 **Status: early Linux prototype.** Process sampling, metadata, lifecycle
 observations, bounded history, CPU spike detection, and contributor rankings
-work today. This is not yet the complete v0.1 experience.
+work today, including a foreground recorder and cross-terminal queries.
+Contextual explanations and performance validation are still in development.
 
 ## Try it
 
@@ -23,21 +24,36 @@ export TMPDIR="$PWD/build/tmp"
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 (cd build && ctest --output-on-failure)
-./build/why sample --count 30 --history
+./build/why watch
 ```
 
-This takes thirty samples at a nominal one-second cadence, prints process CPU
-measurements, and shows retained lifecycle observations on completion. The first
-sample establishes counters; CPU rates become available from the second sample.
-Ctrl-C stops collection and prints the retained summary. CPU spike analysis is
-printed on exit. At least eleven samples are needed for the ten baseline
-intervals, followed by additional samples to confirm a spike. A quiet recording
-may have no spike; the summary still shows retained total CPU rankings.
+Leave `watch` running, then open another terminal in the repository:
 
 ```sh
-./build/why sample --count 30             # Process and CPU samples
-./build/why sample --count 30 --history   # Also print the lifecycle timeline
-./build/why sample --count 5 --details    # Also display captured arguments and paths
+./build/why             # Query the last 60 seconds
+./build/why cpu 30s     # Query the last 30 seconds
+./build/why 300s        # Query up to five minutes of retained history
+```
+
+Both terminals must use the same private runtime directory. By default this is
+`$XDG_RUNTIME_DIR/why-cli`. If your session has no `XDG_RUNTIME_DIR`, set an explicit
+path in both terminals before starting either command:
+
+```sh
+export WHY_RUNTIME_DIR="$PWD/build/why-runtime"
+```
+
+The recorder creates that directory with private permissions. It runs in the
+foreground; Ctrl-C stops it and releases all recorded history. Queries report the
+actual available window, total CPU rankings and overlapping spike events. Allow
+at least eleven samples to establish a baseline, followed by additional samples
+to confirm a spike. No spike is required to see total activity.
+
+For the original diagnostic view:
+
+```sh
+./build/why sample --count 30 --history   # Samples and lifecycle timeline
+./build/why sample --count 5 --details    # Also show captured arguments and paths
 ./build/why --help
 ```
 
@@ -55,10 +71,11 @@ fixture tests, but does not support live sampling yet. See the
 - Baseline-based CPU spike summaries with recovery and interruption states.
 - Separate total and incremental CPU rankings, with conservative sibling grouping.
 - Time-aligned estimates of observed process CPU, without extrapolating missing data.
+- Same-user local queries while the foreground recorder continues sampling.
 - Explicit diagnostics for missing data, partial scans, timing gaps, and truncation.
 
-The recorder runs without root and uses procfs polling. It makes no network
-requests, writes no recording files, and has no daemon or external service.
+The recorder runs without root and uses procfs polling. Queries use a local Unix
+socket; there are no internet requests, recording files, or permanent daemon.
 Arguments are collected in memory but displayed only with `--details`; they may
 contain sensitive values. All retained history is released when the command exits.
 
@@ -74,7 +91,7 @@ measurement is unavailable, not zero. A process disappearance is an observation,
 not proof of when or why it exited.
 
 The 64 MiB budget reserves 48 MiB for history and conservatively charged metadata
-references, and 16 MiB for attribution analysis. Collector working buffers have
+references, and 16 MiB for attribution analysis. Collector working buffers and socket buffers have
 separate limits, so this is not a total RSS guarantee. Memory pressure can shorten
 the retained history.
 
@@ -83,9 +100,9 @@ the retained history.
 1. **Complete:** process/CPU collection, metadata, lifecycle observations, bounded history.
 2. **Complete:** sampling interval alignment and sustained CPU spike detection.
 3. **Complete:** total and incremental CPU contributor ranking with explicit uncertainty.
-4. **Next:** foreground recorder and cross-terminal queries.
+4. **Complete:** foreground recorder and cross-terminal CPU queries.
+5. **Next:** richer contextual explanations and workload performance validation.
 
-`why watch`, `why cpu`, and `why 60s` are planned interfaces, not available commands.
 Memory, disk, network, a TUI, and live macOS support are outside the current scope.
 
 ## Development
