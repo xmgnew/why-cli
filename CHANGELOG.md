@@ -5,6 +5,28 @@ completed v0.1 release; the CMake version `0.1.0` is a development version.
 
 ## Unreleased
 
+### History storage efficiency
+
+- Charge each immutable metadata allocation once per history, including shared
+  parent references; include the bounded accounting index in the same quota.
+- Allocate lifecycle arrays for observed events only. Preserve full process
+  snapshots, unknown values, identity tracking and CPU calculations.
+- Add accounting breakdowns and regression coverage for shared ownership,
+  metadata replacement, eviction and failed append rollback.
+- Extend the 1000-process synthetic retained span from 37 to 119 seconds within
+  the unchanged 48 MiB history quota. Five-minute retention is not yet achieved
+  for this scenario; retaining more frames can increase RSS and query work.
+
+### Performance baseline
+
+- Add opt-in `why_bench` measurements for synthetic retention, live collection and
+  report rendering, plus a Linux end-to-end query tool with controlled workloads.
+- Report aggregate timing percentiles, CPU, RSS, history coverage and scan quality
+  without saving process details or changing normal recorder behavior.
+- Establish a Release baseline and document the 37-second retained span in the
+  synthetic 1000-process metadata scenario; do not claim the live-process target
+  is met. Keep sanitizer correctness checks separate from timing runs.
+
 ### Context evidence
 
 - Show up to eight ancestor levels from the contributor's original retained
@@ -71,7 +93,7 @@ completed v0.1 release; the CMake version `0.1.0` is a development version.
 
 ### Still planned
 
-Performance benchmarking, including query latency and recording overhead, and
+Further process snapshot compaction, broader real-workload performance validation and
 explicit opt-in query metadata expansion. See the [implementation guide](docs/implementation.md)
 for current limits and validation, and the [usage guide](docs/usage.md) for available
 commands. Rankings estimate observed contributions; they do not prove causality.

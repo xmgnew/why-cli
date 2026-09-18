@@ -58,3 +58,13 @@ if(BUILD_TESTING)
   endif()
 endif()
 install(TARGETS why RUNTIME DESTINATION bin)
+
+# Measurement tools are opt-in, not installed and not part of normal builds.
+option(WHY_BENCHMARKS "Build developer performance measurement tools" OFF)
+if(WHY_BENCHMARKS)
+  add_executable(why_bench benchmarks/bench.c)
+  target_link_libraries(why_bench PRIVATE why_core)
+  if(BUILD_TESTING)
+    add_test(NAME benchmark_smoke COMMAND why_bench synthetic 10 5 2)
+  endif()
+endif()

@@ -10,7 +10,7 @@ observed processes contributed to an increase in CPU use.
 observations, bounded history, CPU spike detection, and contributor rankings
 work today, including a foreground recorder and cross-terminal queries.
 Historical parent chains and conservative lifecycle timing evidence are available;
-performance validation and optional query detail expansion remain in development.
+performance targets and optional query detail expansion remain in development.
 
 ## Try it
 
@@ -91,10 +91,11 @@ and cannot reconstruct activity from before recording started. `n/a` means the
 measurement is unavailable, not zero. A process disappearance is an observation,
 not proof of when or why it exited.
 
-The 64 MiB budget reserves 48 MiB for history and conservatively charged metadata
-references, and 16 MiB for attribution analysis. Collector working buffers and socket buffers have
-separate limits, so this is not a total RSS guarantee. Memory pressure can shorten
-the retained history.
+The 64 MiB budget reserves 48 MiB for history and 16 MiB for attribution analysis.
+History charges each shared metadata allocation once, including its accounting
+index, and allocates lifecycle events only when observed. Collector working buffers
+and socket buffers have separate limits, so this is not a total RSS guarantee.
+Memory pressure can shorten the retained history.
 
 ## Road to v0.1
 
@@ -103,7 +104,12 @@ the retained history.
 3. **Complete:** total and incremental CPU contributor ranking with explicit uncertainty.
 4. **Complete:** foreground recorder and cross-terminal CPU queries.
 5. **Complete:** bounded historical parent chains and conservative lifecycle correlations.
-6. **Next:** workload performance validation and optional query detail expansion.
+6. **Baseline measured:** collection/query costs and bounded-history retention;
+   the performance targets are not yet validated.
+7. **Complete:** shared metadata accounting and exact lifecycle event allocation;
+   the 1000-process synthetic scenario now retains 119 seconds, up from 37.
+8. **Next:** compact process snapshots further, expand workload measurements and
+   add optional query detail expansion.
 
 Memory, disk, network, a TUI, and live macOS support are outside the current scope.
 
@@ -111,6 +117,8 @@ Memory, disk, network, a TUI, and live macOS support are outside the current sco
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) for build, test, and review conventions.
 The [changelog](CHANGELOG.md) records development milestones.
+The [benchmark guide](docs/benchmarks.md) documents reproducible measurements and
+current retention/performance limits.
 The [implementation guide](docs/implementation.md) describes module ownership,
 resource limits, current validation, and remaining work. The detailed
 [v0.1 design specification](docs/v0.1-spec.md) is currently written in Chinese.

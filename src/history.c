@@ -5,334 +5,438 @@
 #include <string.h>
 
 typedef struct {
-    WhyIdentity identity;
-    uint64_t last_seen_ns, metadata_ns;
-    bool lost;
+	WhyIdentity identity;
+	uint64_t last_seen_ns, metadata_ns;
+	bool lost;
 } TrackedProcess;
 
+/* Per-history accounting: metadata references remain owned by frame copies.
+ * A ledger node charges the immutable allocation once until its last snapshot
+ * reference is evicted. Other histories maintain independent ledgers. */
+typedef struct MetadataCharge {
+	WhyMetadata *metadata;
+	size_t references;
+	struct MetadataCharge *next;
+} MetadataCharge;
+
 struct WhyHistory {
-    WhyHistoryEntry *first, *last;
-    TrackedProcess *tracked, *scratch;
-    size_t tracked_count, tracking_capacity;
-    uint64_t retention_ns;
-    uint64_t last_accepted_ns;
-    WhyHistoryStats stats;
-    WhyCpuDetector detector;
+	WhyHistoryEntry *first, *last;
+	TrackedProcess *tracked, *scratch;
+	size_t tracked_count, tracking_capacity;
+	uint64_t retention_ns;
+	uint64_t last_accepted_ns;
+	WhyHistoryStats stats;
+	WhyCpuDetector detector;
+	MetadataCharge **metadata;
+	size_t metadata_buckets;
 };
 
 WhyHistory *why_history_create(uint64_t retention_ns, size_t budget,
-                               size_t tracking_capacity) {
-    if (!retention_ns || !tracking_capacity ||
-        tracking_capacity > WHY_MAX_PROCESSES) {
-        errno = EINVAL;
-        return NULL;
-    }
-    size_t base =
-        sizeof(WhyHistory) + 2 * tracking_capacity * sizeof(TrackedProcess);
-    if (budget < base) {
-        errno = ENOSPC;
-        return NULL;
-    }
-    WhyHistory *h = calloc(1, sizeof *h);
-    if (!h)
-        return NULL;
-    h->tracked = calloc(tracking_capacity, sizeof *h->tracked);
-    h->scratch = calloc(tracking_capacity, sizeof *h->scratch);
-    if (!h->tracked || !h->scratch) {
-        why_history_destroy(h);
-        return NULL;
-    }
-    h->retention_ns = retention_ns;
-    h->tracking_capacity = tracking_capacity;
-    h->stats.bytes = base;
-    h->stats.budget = budget;
-    return h;
+							   size_t tracking_capacity) {
+	if (!retention_ns || !tracking_capacity ||
+		tracking_capacity > WHY_MAX_PROCESSES) {
+		errno = EINVAL;
+		return NULL;
+	}
+	size_t base = sizeof(WhyHistory) +
+				  2 * tracking_capacity *
+					  (sizeof(TrackedProcess) + sizeof(MetadataCharge *));
+	if (budget < base) {
+		errno = ENOSPC;
+		return NULL;
+	}
+	WhyHistory *h = calloc(1, sizeof *h);
+	if (!h)
+		return NULL;
+	h->metadata_buckets = 2 * tracking_capacity;
+	h->metadata = calloc(h->metadata_buckets, sizeof *h->metadata);
+	h->tracked = calloc(tracking_capacity, sizeof *h->tracked);
+	h->scratch = calloc(tracking_capacity, sizeof *h->scratch);
+	if (!h->tracked || !h->scratch || !h->metadata) {
+		why_history_destroy(h);
+		return NULL;
+	}
+	h->retention_ns = retention_ns;
+	h->tracking_capacity = tracking_capacity;
+	h->stats.bytes = h->stats.bookkeeping_bytes = base;
+	h->stats.budget = budget;
+	return h;
+}
+
+static MetadataCharge **metadata_slot(WhyHistory *h,
+									  const WhyMetadata *metadata) {
+	size_t bucket = (size_t)(((uintptr_t)metadata >> 4) % h->metadata_buckets);
+	MetadataCharge **slot = &h->metadata[bucket];
+	while (*slot && (*slot)->metadata != metadata)
+		slot = &(*slot)->next;
+	return slot;
+}
+
+static void release_charge(WhyHistory *h, WhyMetadata *metadata) {
+	if (!metadata)
+		return;
+	MetadataCharge **slot = metadata_slot(h, metadata);
+	MetadataCharge *charge = *slot;
+	if (--charge->references)
+		return;
+	*slot = charge->next;
+	h->stats.bytes -= metadata->allocation_bytes + sizeof *charge;
+	h->stats.metadata_bytes -= metadata->allocation_bytes;
+	h->stats.bookkeeping_bytes -= sizeof *charge;
+	--h->stats.metadata_allocations;
+	free(charge);
 }
 
 static void evict(WhyHistory *h) {
-    WhyHistoryEntry *entry = h->first;
-    h->first = entry->next;
-    h->stats.bytes -= entry->charged_bytes;
-    --h->stats.frames;
-    ++h->stats.evicted_frames;
-    why_frame_destroy(&entry->frame);
-    free(entry->events);
-    free(entry);
-    if (!h->first)
-        h->last = NULL;
-    h->stats.oldest_ns = h->first ? h->first->frame.begin_ns : 0;
-    h->stats.newest_ns = h->last ? h->last->frame.end_ns : 0;
+	WhyHistoryEntry *entry = h->first;
+	h->first = entry->next;
+	h->stats.bytes -= entry->charged_bytes;
+	h->stats.frame_bytes -= entry->charged_bytes;
+	for (size_t i = 0; i < entry->frame.count; ++i) {
+		release_charge(h, entry->frame.processes[i].metadata);
+		release_charge(h, entry->frame.processes[i].parent_metadata);
+	}
+	--h->stats.frames;
+	++h->stats.evicted_frames;
+	why_frame_destroy(&entry->frame);
+	free(entry->events);
+	free(entry);
+	if (!h->first)
+		h->last = NULL;
+	h->stats.oldest_ns = h->first ? h->first->frame.begin_ns : 0;
+	h->stats.newest_ns = h->last ? h->last->frame.end_ns : 0;
+}
+
+/* Reserve before allocating; incoming reservations survive eviction. */
+static bool reserve(WhyHistory *h, size_t bytes) {
+	if (bytes > h->stats.budget) {
+		errno = ENOSPC;
+		return false;
+	}
+	while (h->first && h->stats.bytes > h->stats.budget - bytes)
+		evict(h);
+	if (h->stats.bytes > h->stats.budget - bytes) {
+		errno = ENOSPC;
+		return false;
+	}
+	h->stats.bytes += bytes;
+	return true;
+}
+
+static bool acquire_charge(WhyHistory *h, WhyMetadata *metadata) {
+	if (!metadata)
+		return true;
+	MetadataCharge **slot = metadata_slot(h, metadata);
+	if (*slot) {
+		++(*slot)->references;
+		return true;
+	}
+	if (metadata->allocation_bytes < sizeof *metadata ||
+		metadata->allocation_bytes > SIZE_MAX - sizeof(MetadataCharge)) {
+		errno = ENOSPC;
+		return false;
+	}
+	size_t bytes = metadata->allocation_bytes + sizeof(MetadataCharge);
+	if (!reserve(h, bytes))
+		return false;
+	MetadataCharge *charge = malloc(sizeof *charge);
+	if (!charge) {
+		h->stats.bytes -= bytes;
+		return false;
+	}
+	/* Eviction can unlink a bucket's old head, so refresh the insertion slot.
+	 */
+	slot = metadata_slot(h, metadata);
+	*charge = (MetadataCharge){.metadata = metadata, .references = 1};
+	*slot = charge;
+	h->stats.metadata_bytes += metadata->allocation_bytes;
+	h->stats.bookkeeping_bytes += sizeof *charge;
+	++h->stats.metadata_allocations;
+	return true;
+}
+
+static WhyMetadata *frame_metadata(const WhyFrame *frame, size_t field) {
+	const WhyProcess *p = &frame->processes[field / 2];
+	return field % 2 ? p->parent_metadata : p->metadata;
 }
 
 void why_history_destroy(WhyHistory *h) {
-    if (!h)
-        return;
-    while (h->first)
-        evict(h);
-    free(h->tracked);
-    free(h->scratch);
-    free(h);
+	if (!h)
+		return;
+	while (h->first)
+		evict(h);
+	free(h->metadata);
+	free(h->tracked);
+	free(h->scratch);
+	free(h);
 }
 
 static const TrackedProcess *find_tracked(const WhyHistory *h, uint32_t pid) {
-    size_t lo = 0, hi = h->tracked_count;
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (h->tracked[mid].identity.pid < pid)
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
-    return lo < h->tracked_count && h->tracked[lo].identity.pid == pid
-               ? &h->tracked[lo]
-               : NULL;
+	size_t lo = 0, hi = h->tracked_count;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (h->tracked[mid].identity.pid < pid)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo < h->tracked_count && h->tracked[lo].identity.pid == pid
+			   ? &h->tracked[lo]
+			   : NULL;
 }
 
 static void event(WhyHistoryEntry *entry, WhyLifecycleType type,
-                  WhyIdentity identity, uint64_t earliest, uint64_t latest) {
-    entry->events[entry->event_count++] =
-        (WhyLifecycle){.type = type,
-                       .identity = identity,
-                       .earliest_ns = earliest,
-                       .latest_ns = latest};
+				  WhyIdentity identity, uint64_t earliest, uint64_t latest) {
+	if (entry->events)
+		entry->events[entry->event_count] =
+			(WhyLifecycle){.type = type,
+						   .identity = identity,
+						   .earliest_ns = earliest,
+						   .latest_ns = latest};
+	++entry->event_count;
 }
 
 static int compare_tracked(const void *a, const void *b) {
-    const TrackedProcess *x = a, *y = b;
-    return (x->identity.pid > y->identity.pid) -
-           (x->identity.pid < y->identity.pid);
+	const TrackedProcess *x = a, *y = b;
+	return (x->identity.pid > y->identity.pid) -
+		   (x->identity.pid < y->identity.pid);
 }
 
-static void lifecycle(WhyHistory *h, WhyHistoryEntry *entry) {
-    const WhyFrame *f = &entry->frame;
-    size_t count = 0;
-    /* Preserve existing unknown identities before admitting new ones at the
-     * cap. */
-    for (size_t i = 0; i < h->tracked_count; ++i) {
-        TrackedProcess t = h->tracked[i];
-        const WhyProcess *p = why_find_process(f, t.identity.pid);
-        bool gone = (!p && f->complete) || (p && p->status == WHY_GONE) ||
-                    (p && p->status == WHY_READ_OK &&
-                     !why_identity_equal(t.identity, p->id));
-        if (gone) {
-            event(entry, WHY_NO_LONGER_OBSERVED, t.identity, t.last_seen_ns,
-                  p ? p->end_ns : f->end_ns);
-            continue;
-        }
-        if (!p || p->status != WHY_READ_OK) {
-            if (!t.lost)
-                event(entry, WHY_VISIBILITY_LOST, t.identity, t.last_seen_ns,
-                      f->end_ns);
-            t.lost = true;
-        } else {
-            if (t.lost)
-                event(entry, WHY_VISIBILITY_RESTORED, t.identity,
-                      t.last_seen_ns, p->end_ns);
-            if (p->metadata_changed)
-                event(entry, WHY_METADATA_CHANGED, t.identity,
-                      t.metadata_ns ? t.metadata_ns : t.last_seen_ns,
-                      p->metadata ? p->metadata->end_ns : p->end_ns);
-            t.lost = false;
-            t.last_seen_ns = p->end_ns;
-            if (p->metadata)
-                t.metadata_ns = p->metadata->end_ns;
-        }
-        h->scratch[count++] = t;
-    }
-    for (size_t i = 0; i < f->count; ++i) {
-        const WhyProcess *p = &f->processes[i];
-        if (p->status != WHY_READ_OK)
-            continue;
-        const TrackedProcess *old = find_tracked(h, p->id.pid);
-        if (old && why_identity_equal(old->identity, p->id))
-            continue;
-        if (count == h->tracking_capacity) {
-            ++h->stats.tracking_dropped;
-            ++entry->tracking_dropped;
-            continue;
-        }
-        event(entry, WHY_FIRST_SEEN, p->id, p->end_ns, p->end_ns);
-        h->scratch[count++] = (TrackedProcess){
-            .identity = p->id,
-            .last_seen_ns = p->end_ns,
-            .metadata_ns = p->metadata ? p->metadata->end_ns : 0};
-    }
-    qsort(h->scratch, count, sizeof *h->scratch, compare_tracked);
-    TrackedProcess *swap = h->tracked;
-    h->tracked = h->scratch;
-    h->scratch = swap;
-    h->tracked_count = count;
-}
-
-static bool add_bytes(size_t *bytes, size_t more) {
-    if (SIZE_MAX - *bytes < more)
-        return false;
-    *bytes += more;
-    return true;
+static void lifecycle(WhyHistory *h, WhyHistoryEntry *entry, bool commit) {
+	const WhyFrame *f = &entry->frame;
+	size_t count = 0;
+	/* Preserve existing unknown identities before admitting new ones at the
+	 * cap. */
+	for (size_t i = 0; i < h->tracked_count; ++i) {
+		TrackedProcess t = h->tracked[i];
+		const WhyProcess *p = why_find_process(f, t.identity.pid);
+		bool gone = (!p && f->complete) || (p && p->status == WHY_GONE) ||
+					(p && p->status == WHY_READ_OK &&
+					 !why_identity_equal(t.identity, p->id));
+		if (gone) {
+			event(entry, WHY_NO_LONGER_OBSERVED, t.identity, t.last_seen_ns,
+				  p ? p->end_ns : f->end_ns);
+			continue;
+		}
+		if (!p || p->status != WHY_READ_OK) {
+			if (!t.lost)
+				event(entry, WHY_VISIBILITY_LOST, t.identity, t.last_seen_ns,
+					  f->end_ns);
+			t.lost = true;
+		} else {
+			if (t.lost)
+				event(entry, WHY_VISIBILITY_RESTORED, t.identity,
+					  t.last_seen_ns, p->end_ns);
+			if (p->metadata_changed)
+				event(entry, WHY_METADATA_CHANGED, t.identity,
+					  t.metadata_ns ? t.metadata_ns : t.last_seen_ns,
+					  p->metadata ? p->metadata->end_ns : p->end_ns);
+			t.lost = false;
+			t.last_seen_ns = p->end_ns;
+			if (p->metadata)
+				t.metadata_ns = p->metadata->end_ns;
+		}
+		h->scratch[count++] = t;
+	}
+	for (size_t i = 0; i < f->count; ++i) {
+		const WhyProcess *p = &f->processes[i];
+		if (p->status != WHY_READ_OK)
+			continue;
+		const TrackedProcess *old = find_tracked(h, p->id.pid);
+		if (old && why_identity_equal(old->identity, p->id))
+			continue;
+		if (count == h->tracking_capacity) {
+			if (commit)
+				++h->stats.tracking_dropped;
+			++entry->tracking_dropped;
+			continue;
+		}
+		event(entry, WHY_FIRST_SEEN, p->id, p->end_ns, p->end_ns);
+		h->scratch[count++] = (TrackedProcess){
+			.identity = p->id,
+			.last_seen_ns = p->end_ns,
+			.metadata_ns = p->metadata ? p->metadata->end_ns : 0};
+	}
+	if (!commit)
+		return;
+	qsort(h->scratch, count, sizeof *h->scratch, compare_tracked);
+	TrackedProcess *swap = h->tracked;
+	h->tracked = h->scratch;
+	h->scratch = swap;
+	h->tracked_count = count;
 }
 
 bool why_history_append(WhyHistory *h, const WhyFrame *frame, long hz) {
-    if (!h || !frame || hz <= 0 || frame->count > WHY_MAX_PROCESSES ||
-        (frame->count && !frame->processes) ||
-        frame->begin_ns > frame->end_ns ||
-        (h->last_accepted_ns && frame->end_ns <= h->last_accepted_ns)) {
-        errno = EINVAL;
-        return false;
-    }
-    for (size_t i = 0; i < frame->count; ++i) {
-        const WhyProcess *p = &frame->processes[i];
-        if ((i && p->id.pid <= frame->processes[i - 1].id.pid) ||
-            p->begin_ns > p->end_ns || p->end_ns > frame->end_ns) {
-            errno = EINVAL;
-            return false;
-        }
-    }
-    size_t event_capacity = 2 * h->tracked_count + frame->count;
-    size_t bytes = sizeof(WhyHistoryEntry) + frame->count * sizeof(WhyProcess) +
-                   event_capacity * sizeof(WhyLifecycle);
-    for (size_t i = 0; i < frame->count; ++i) {
-        const WhyProcess *p = &frame->processes[i];
-        if ((p->metadata &&
-             !add_bytes(&bytes, p->metadata->allocation_bytes)) ||
-            (p->parent_metadata &&
-             !add_bytes(&bytes, p->parent_metadata->allocation_bytes))) {
-            errno = ENOSPC;
-            return false;
-        }
-    }
-    size_t base = sizeof *h + 2 * h->tracking_capacity * sizeof(TrackedProcess);
-    if (bytes > h->stats.budget - base) {
-        errno = ENOSPC;
-        return false;
-    }
-    WhySystemInterval interval =
-        why_system_interval(h->last ? &h->last->frame : NULL, frame, hz);
-    bool gap = h->last && interval.validity != WHY_OK;
-    while (h->first &&
-           (h->stats.bytes > h->stats.budget - bytes ||
-            frame->end_ns - h->first->frame.end_ns > h->retention_ns ||
-            (frame->boot_ns >= h->first->frame.boot_ns &&
-             frame->boot_ns - h->first->frame.boot_ns > h->retention_ns)))
-        evict(h);
-    WhyHistoryEntry *entry = calloc(1, sizeof *entry);
-    if (!entry)
-        return false;
-    entry->frame = *frame;
-    entry->frame.count = 0;
-    entry->frame.capacity = frame->count;
-    entry->frame.processes =
-        frame->count ? malloc(frame->count * sizeof(WhyProcess)) : NULL;
-    entry->events =
-        event_capacity ? calloc(event_capacity, sizeof *entry->events) : NULL;
-    if ((frame->count && !entry->frame.processes) ||
-        (event_capacity && !entry->events)) {
-        why_frame_destroy(&entry->frame);
-        free(entry->events);
-        free(entry);
-        return false;
-    }
-    for (size_t i = 0; i < frame->count; ++i) {
-        entry->frame.processes[i] = frame->processes[i];
-        why_metadata_retain(frame->processes[i].metadata);
-        why_metadata_retain(frame->processes[i].parent_metadata);
-    }
-    entry->frame.count = frame->count;
-    entry->sampling_gap = gap;
-    entry->charged_bytes = bytes;
-    lifecycle(h, entry);
-    entry->incident_completed =
-        why_detector_push(&h->detector, interval, &entry->incident);
-    if (h->last)
-        h->last->next = entry;
-    else
-        h->first = entry;
-    h->last = entry;
-    h->stats.bytes += bytes;
-    ++h->stats.frames;
-    h->stats.oldest_ns = h->first->frame.begin_ns;
-    h->stats.newest_ns = frame->end_ns;
-    h->last_accepted_ns = frame->end_ns;
-    return true;
+	if (!h || !frame || hz <= 0 || frame->count > WHY_MAX_PROCESSES ||
+		(frame->count && !frame->processes) ||
+		frame->begin_ns > frame->end_ns ||
+		(h->last_accepted_ns && frame->end_ns <= h->last_accepted_ns)) {
+		errno = EINVAL;
+		return false;
+	}
+	for (size_t i = 0; i < frame->count; ++i) {
+		const WhyProcess *p = &frame->processes[i];
+		if ((i && p->id.pid <= frame->processes[i - 1].id.pid) ||
+			p->begin_ns > p->end_ns || p->end_ns > frame->end_ns) {
+			errno = EINVAL;
+			return false;
+		}
+	}
+	/* The input must remain owned by the caller throughout possible eviction.
+	 */
+	for (const WhyHistoryEntry *e = h->first; e; e = e->next) {
+		if (frame == &e->frame ||
+			(frame->processes && frame->processes == e->frame.processes)) {
+			errno = EINVAL;
+			return false;
+		}
+	}
+	WhyHistoryEntry preview = {.frame = *frame};
+	lifecycle(h, &preview, false);
+	size_t event_capacity = preview.event_count;
+	size_t bytes = sizeof(WhyHistoryEntry) + frame->count * sizeof(WhyProcess) +
+				   event_capacity * sizeof(WhyLifecycle);
+	WhySystemInterval interval =
+		why_system_interval(h->last ? &h->last->frame : NULL, frame, hz);
+	bool gap = h->last && interval.validity != WHY_OK;
+	while (h->first &&
+		   (frame->end_ns - h->first->frame.end_ns > h->retention_ns ||
+			(frame->boot_ns >= h->first->frame.boot_ns &&
+			 frame->boot_ns - h->first->frame.boot_ns > h->retention_ns)))
+		evict(h);
+	if (!reserve(h, bytes))
+		return false;
+	size_t acquired = 0;
+	for (; acquired < 2 * frame->count; ++acquired) {
+		if (!acquire_charge(h, frame_metadata(frame, acquired)))
+			goto rollback;
+	}
+	WhyHistoryEntry *entry = calloc(1, sizeof *entry);
+	if (!entry)
+		goto rollback;
+	entry->frame = *frame;
+	entry->frame.count = 0;
+	entry->frame.capacity = frame->count;
+	entry->frame.processes =
+		frame->count ? malloc(frame->count * sizeof(WhyProcess)) : NULL;
+	entry->events =
+		event_capacity ? calloc(event_capacity, sizeof *entry->events) : NULL;
+	if ((frame->count && !entry->frame.processes) ||
+		(event_capacity && !entry->events)) {
+		why_frame_destroy(&entry->frame);
+		free(entry->events);
+		free(entry);
+		goto rollback;
+	}
+	for (size_t i = 0; i < frame->count; ++i) {
+		entry->frame.processes[i] = frame->processes[i];
+		why_metadata_retain(frame->processes[i].metadata);
+		why_metadata_retain(frame->processes[i].parent_metadata);
+	}
+	entry->frame.count = frame->count;
+	entry->sampling_gap = gap;
+	entry->charged_bytes = bytes;
+	lifecycle(h, entry, true);
+	entry->incident_completed =
+		why_detector_push(&h->detector, interval, &entry->incident);
+	if (h->last)
+		h->last->next = entry;
+	else
+		h->first = entry;
+	h->last = entry;
+	h->stats.frame_bytes += bytes;
+	++h->stats.frames;
+	h->stats.oldest_ns = h->first->frame.begin_ns;
+	h->stats.newest_ns = frame->end_ns;
+	h->last_accepted_ns = frame->end_ns;
+	return true;
+rollback:;
+	int saved = errno;
+	while (acquired)
+		release_charge(h, frame_metadata(frame, --acquired));
+	h->stats.bytes -= bytes;
+	errno = saved;
+	return false;
 }
 
 const WhyHistoryEntry *why_history_first(const WhyHistory *h) {
-    return h->first;
+	return h->first;
 }
 const WhyHistoryEntry *why_history_latest(const WhyHistory *h) {
-    return h->last;
+	return h->last;
 }
 WhyHistoryStats why_history_stats(const WhyHistory *h) { return h->stats; }
 
 const char *why_lifecycle_name(WhyLifecycleType type) {
-    switch (type) {
-    case WHY_FIRST_SEEN:
-        return "first seen";
-    case WHY_NO_LONGER_OBSERVED:
-        return "no longer observed";
-    case WHY_VISIBILITY_LOST:
-        return "visibility lost";
-    case WHY_VISIBILITY_RESTORED:
-        return "visibility restored";
-    case WHY_METADATA_CHANGED:
-        return "metadata changed";
-    }
-    return "unknown";
+	switch (type) {
+	case WHY_FIRST_SEEN:
+		return "first seen";
+	case WHY_NO_LONGER_OBSERVED:
+		return "no longer observed";
+	case WHY_VISIBILITY_LOST:
+		return "visibility lost";
+	case WHY_VISIBILITY_RESTORED:
+		return "visibility restored";
+	case WHY_METADATA_CHANGED:
+		return "metadata changed";
+	}
+	return "unknown";
 }
 
 const WhyCpuDetector *why_history_detector(const WhyHistory *h) {
-    return &h->detector;
+	return &h->detector;
 }
 
 WhyAlignedSummary why_history_align(const WhyHistory *h, uint64_t start_ns,
-                                    uint64_t end_ns, long hz,
-                                    WhyAlignedVisitor visitor, void *context) {
-    WhyAlignedSummary result = {0};
-    if (!h->first || end_ns <= start_ns || hz <= 0) {
-        result.left_truncated = result.right_provisional = true;
-        return result;
-    }
-    const WhySystem *first = &h->first->frame.system,
-                    *last = &h->last->frame.system;
-    uint64_t first_time =
-        first->begin_ns + (first->end_ns - first->begin_ns) / 2;
-    uint64_t last_time = last->begin_ns + (last->end_ns - last->begin_ns) / 2;
-    result.left_truncated = start_ns <= first_time;
-    result.right_provisional = end_ns > last_time;
-    for (const WhyHistoryEntry *a = h->first; a && a->next; a = a->next) {
-        const WhyHistoryEntry *b = a->next;
-        if (b->frame.end_ns < start_ns || a->frame.begin_ns > end_ns)
-            continue;
-        result.partial_scan |= !a->frame.complete || !b->frame.complete ||
-                               a->tracking_dropped || b->tracking_dropped;
-        result.timing_degraded |=
-            a->frame.end_ns - a->frame.begin_ns > WHY_SECOND / 5 ||
-            b->frame.end_ns - b->frame.begin_ns > WHY_SECOND / 5;
-        for (size_t i = 0; i < a->frame.count; ++i) {
-            const WhyProcess *p = &a->frame.processes[i];
-            if (p->status == WHY_READ_OK &&
-                !why_find_process(&b->frame, p->id.pid))
-                ++result.unavailable_intervals;
-        }
-        for (size_t i = 0; i < b->frame.count; ++i) {
-            const WhyProcess *p = &b->frame.processes[i];
-            const WhyProcess *old = why_find_process(&a->frame, p->id.pid);
-            if (b->sampling_gap) {
-                ++result.unavailable_intervals;
-                continue;
-            }
-            WhyCpuOverlap portion =
-                why_cpu_overlap(old, p, hz, start_ns, end_ns);
-            if (portion.validity != WHY_OK) {
-                ++result.unavailable_intervals;
-                continue;
-            }
-            if (portion.covered_seconds > 0) {
-                result.cpu_seconds += portion.cpu_seconds;
-                ++result.portions;
-                if (visitor)
-                    visitor(p->id, portion, context);
-            }
-        }
-    }
-    return result;
+									uint64_t end_ns, long hz,
+									WhyAlignedVisitor visitor, void *context) {
+	WhyAlignedSummary result = {0};
+	if (!h->first || end_ns <= start_ns || hz <= 0) {
+		result.left_truncated = result.right_provisional = true;
+		return result;
+	}
+	const WhySystem *first = &h->first->frame.system,
+					*last = &h->last->frame.system;
+	uint64_t first_time =
+		first->begin_ns + (first->end_ns - first->begin_ns) / 2;
+	uint64_t last_time = last->begin_ns + (last->end_ns - last->begin_ns) / 2;
+	result.left_truncated = start_ns <= first_time;
+	result.right_provisional = end_ns > last_time;
+	for (const WhyHistoryEntry *a = h->first; a && a->next; a = a->next) {
+		const WhyHistoryEntry *b = a->next;
+		if (b->frame.end_ns < start_ns || a->frame.begin_ns > end_ns)
+			continue;
+		result.partial_scan |= !a->frame.complete || !b->frame.complete ||
+							   a->tracking_dropped || b->tracking_dropped;
+		result.timing_degraded |=
+			a->frame.end_ns - a->frame.begin_ns > WHY_SECOND / 5 ||
+			b->frame.end_ns - b->frame.begin_ns > WHY_SECOND / 5;
+		for (size_t i = 0; i < a->frame.count; ++i) {
+			const WhyProcess *p = &a->frame.processes[i];
+			if (p->status == WHY_READ_OK &&
+				!why_find_process(&b->frame, p->id.pid))
+				++result.unavailable_intervals;
+		}
+		for (size_t i = 0; i < b->frame.count; ++i) {
+			const WhyProcess *p = &b->frame.processes[i];
+			const WhyProcess *old = why_find_process(&a->frame, p->id.pid);
+			if (b->sampling_gap) {
+				++result.unavailable_intervals;
+				continue;
+			}
+			WhyCpuOverlap portion =
+				why_cpu_overlap(old, p, hz, start_ns, end_ns);
+			if (portion.validity != WHY_OK) {
+				++result.unavailable_intervals;
+				continue;
+			}
+			if (portion.covered_seconds > 0) {
+				result.cpu_seconds += portion.cpu_seconds;
+				++result.portions;
+				if (visitor)
+					visitor(p->id, portion, context);
+			}
+		}
+	}
+	return result;
 }

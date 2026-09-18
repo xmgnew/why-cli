@@ -5,7 +5,7 @@
 The collector, metadata/history, interval alignment, CPU spike detection, and
 contributor ranking and foreground recorder/query milestones are implemented.
 The [v0.1 specification](v0.1-spec.md) remains the design target; optional query detail
-expansion and performance validation are pending. Version `0.1.0` denotes development work.
+expansion and full performance validation are pending. Version `0.1.0` denotes development work.
 
 `why watch` records in the foreground; `why`, `why Ns`, and `why cpu [Ns]` query
 its retained CPU history from another terminal. `why sample` remains available
@@ -33,6 +33,8 @@ for per-sample diagnostics and optional metadata/lifecycle output.
 | `tests/linux_recorder.sh` | Live watch/query, continued sampling and shutdown integration. |
 | `tests/test_core.c` | Parser, CPU, identity, clock and collector integration fixtures. |
 | `tests/test_history.c` | Metadata, ownership, lifecycle and retention regressions. |
+| `benchmarks/bench.c` | Opt-in synthetic/live collection, retention and frozen-history rendering measurements. |
+| `benchmarks/query_latency.py` | Owned recorder/workload lifecycle and end-to-end Linux query measurements. |
 | `tests/linux_lifecycle.sh` | Linux-only live process appearance/disappearance test. |
 
 The pipeline is:
@@ -97,7 +99,8 @@ There is no claim of complete process lifecycle coverage.
 
 ## Storage and limits
 
-History is a FIFO of compact frame copies and lifecycle observations. Append
+History is a FIFO of frame copies and lifecycle observations. Every retained frame
+still contains full process records, allocated for its actual process count. Append
 requires increasing observation times. Old snapshots are evicted on elapsed-time
 expiry or byte pressure; BOOTTIME expiry also covers suspend time. The public
 internal history views are borrowed and may become invalid on the next append.
@@ -122,9 +125,26 @@ internal history views are borrowed and may become invalid on the next append.
 | Full incidents shown per query | Latest 8 overlapping incidents |
 
 The history quota includes history structures, both fixed tracking arrays,
-event/frame allocations, and metadata reference charges. Shared metadata is
-conservatively charged per snapshot reference, so quota eviction can happen before
-physical allocation reaches that amount. Oversized snapshots fail explicitly.
+event/frame allocations, and a per-history metadata ledger. The ledger uses
+`2 * tracking_capacity` fixed hash buckets and one node per distinct metadata
+allocation, keyed by pointer identity. All buckets and nodes count toward the
+quota. A shared immutable allocation is charged once while any snapshot in this
+history references it, including parent references; equal content in separate
+allocations is still charged separately. Multiple histories account independently.
+
+Lifecycle transitions are counted before allocating the exact event array; a
+frame without events allocates none. Counting does not commit tracker state.
+Append reserves quota and stages ledger references before copying the caller's
+frame. Failure rolls those references and reservations back without advancing the
+tracker or detector; older frames may already have been evicted. The caller must
+own the input throughout append and must not pass a borrowed history frame.
+Snapshot eviction removes ledger charges before releasing actual metadata
+references, keeping accounting separate from allocation lifetime.
+
+`WhyHistoryStats.bytes` equals `frame_bytes + metadata_bytes + bookkeeping_bytes`
+after every append, including failure. Bookkeeping includes the detector, fixed
+tracking arrays, ledger buckets and nodes; frame bytes include process records and
+actual lifecycle events. Oversized snapshots fail explicitly.
 The collector's two working arrays, context allocations and read scratch are
 separately bounded, as are the fixed IPC buffers; the recording quota is not a
 total-process RSS limit.
@@ -176,7 +196,8 @@ processes, unknown/partial baselines, same/different parents and executables,
 context changes, fractional bin clipping, missing reads, accounting mismatch,
 slow/partial scans, baseline gaps, eviction, empty measurements and capacity limits.
 Parent chains and lifecycle timing evidence are described below. Ancestor CPU
-rollups are deliberately excluded. Performance targets have not been benchmarked.
+rollups are deliberately excluded. Initial benchmark results are documented in [benchmarks.md](benchmarks.md);
+the specification targets have not been validated.
 
 ## Context evidence
 
@@ -266,16 +287,34 @@ add SIGKILL/rebind checks and assert that no runtime socket or lock was created.
 of edited C files and repository-local Markdown links were checked.
 See [CONTRIBUTING.md](../CONTRIBUTING.md#build-and-test) to reproduce the suite.
 
-These results are regression and smoke checks, not a performance study. QEMU runs
-can exceed the 200 ms scan-quality threshold. The CPU-overhead and 1000-process
-targets still require benchmarking. GitHub Actions is configured for Linux
-GCC/Clang and macOS Clang; hosted CI results have not been verified here.
+Storage fixtures cover shared child/parent metadata, independent histories,
+replacement allocations, collision chains, budget/time eviction, two simultaneous
+lifecycle events, and failed appends after staged references and eviction. They
+check quota totals, reference lifetimes and unchanged tracker/detector state on
+failure.
+
+The normal correctness suite remains 14 portable tests and 16 Linux tests. Enabling
+`WHY_BENCHMARKS` adds a synthetic smoke check. At the benchmark milestone, the
+extended macOS suite passed 15/15 and the extended Linux VM suite passed 17/17 with
+ASan/UBSan and `-Werror`. A separate sanitized 1000-identity, 360-frame run checked
+metadata ownership and eviction. The same extended suites and sanitized stress
+runs passed after the storage optimization; timing measurements used unsanitized Release
+builds instead. The Python tool was exercised with idle, CPU and churn workloads.
+
+Initial measurements and limits are in the [benchmark guide](benchmarks.md).
+These VM observations do not establish physical Linux performance or the
+1000-live-process target. GitHub Actions is configured for Linux GCC/Clang and
+macOS Clang; hosted CI results have not been verified here.
 
 ## Remaining work
 
-1. Benchmark recording overhead, query latency and retention under larger process
-   populations before optimizing the synchronous query renderer.
-2. Add explicit opt-in query metadata expansion with observation timestamps and
+1. Compact historical process records without discarding identities or weakening
+   unknown-data semantics. Shared allocation accounting and exact event arrays
+   extended the synthetic 1000-process retained span from 37 to 119 seconds under
+   the same quota. Full process records still dominate; five minutes remains a target.
+2. Repeat measurements on physical Linux and extend to controlled 1000-process
+   collection, parallel compilation, longer runs and spike-heavy queries.
+3. Add explicit opt-in query metadata expansion with observation timestamps and
    privacy-preserving defaults.
 
 There is no persistent recording format or restart recovery. The current build

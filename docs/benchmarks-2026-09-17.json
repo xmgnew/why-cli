@@ -1,0 +1,256 @@
+{
+  "date": "2026-09-17",
+  "build": "Release, WHY_SANITIZE=OFF, -Werror",
+  "linux_environment": {
+    "type": "x86_64 Debian QEMU VM",
+    "kernel": "6.12.107+deb13-amd64",
+    "logical_cpus": 8,
+    "compiler": "GCC 14.2.0"
+  },
+  "linux": {
+    "synthetic_1000": {
+      "schema": 1,
+      "mode": "synthetic",
+      "samples": 360,
+      "query_repetitions": 20,
+      "entries_min": 1000,
+      "entries_max": 1000,
+      "generate_ms": {
+        "count": 360,
+        "p50": 0.014,
+        "p95": 0.062,
+        "p99": 0.112
+      },
+      "append_ms": {
+        "count": 360,
+        "p50": 0.665,
+        "p95": 2.668002,
+        "p99": 3.486001
+      },
+      "render_60s_ms": {
+        "count": 20,
+        "p50": 35.512019,
+        "p95": 44.304023,
+        "p99": 52.229027
+      },
+      "recording_wall_seconds": 0.37842,
+      "recording_cpu_seconds": 0.377862,
+      "recording_one_core_pct": null,
+      "peak_rss_bytes": 30060544,
+      "retained_seconds": 37.0,
+      "retained_frames": 38,
+      "history_charged_bytes": 49750664,
+      "history_budget_bytes": 50331648,
+      "evicted_frames": 322,
+      "gaps": 0,
+      "partial_scans": 0,
+      "slow_scans": 0,
+      "skipped_entries": 0,
+      "denied_reads": 0,
+      "malformed_reads": 0,
+      "io_errors": 0,
+      "metadata_skipped": 0,
+      "system_cpu_seconds": 37.0,
+      "process_cpu_seconds": 37.0,
+      "signed_residual_seconds": -0.0,
+      "report_bytes": 1226
+    },
+    "live_idle": {
+      "schema": 1,
+      "mode": "live",
+      "samples": 30,
+      "query_repetitions": 20,
+      "entries_min": 183,
+      "entries_max": 183,
+      "collect_ms": {
+        "count": 30,
+        "p50": 41.761023,
+        "p95": 60.797044,
+        "p99": 60.963206
+      },
+      "append_ms": {
+        "count": 30,
+        "p50": 0.280001,
+        "p95": 1.201001,
+        "p99": 10.240007
+      },
+      "render_60s_ms": {
+        "count": 20,
+        "p50": 7.455024,
+        "p95": 15.360049,
+        "p99": 21.184067
+      },
+      "recording_wall_seconds": 29.038428,
+      "recording_cpu_seconds": 1.235744,
+      "recording_one_core_pct": 4.255547,
+      "peak_rss_bytes": 17690624,
+      "retained_seconds": 29.037978,
+      "retained_frames": 30,
+      "history_charged_bytes": 6970604,
+      "history_budget_bytes": 50331648,
+      "evicted_frames": 0,
+      "gaps": 0,
+      "partial_scans": 0,
+      "slow_scans": 0,
+      "skipped_entries": 0,
+      "denied_reads": 0,
+      "malformed_reads": 0,
+      "io_errors": 0,
+      "metadata_skipped": 0,
+      "system_cpu_seconds": 1.83,
+      "process_cpu_seconds": 1.848414,
+      "signed_residual_seconds": -0.018414,
+      "report_bytes": 1676
+    },
+    "ipc_idle": {
+      "schema": 1,
+      "mode": "ipc",
+      "load": "none",
+      "warmup_seconds": 12,
+      "query_interval_seconds": 0.5,
+      "queries_requested": 40,
+      "failures": 0,
+      "query_wall_ms": {
+        "count": 40,
+        "p50": 40.49510600003714,
+        "p95": 56.47014800001671,
+        "p99": 69.10218999996687
+      },
+      "reported_observation_age_seconds": {
+        "count": 40,
+        "p50": 0.481,
+        "p95": 0.922,
+        "p99": 0.992
+      },
+      "recording_wall_seconds": 21.752582699000016,
+      "recorder_cpu_seconds": 1.36,
+      "recorder_one_core_pct": 6.252131155269762,
+      "sampled_peak_recorder_rss_bytes": 17616896
+    },
+    "ipc_cpu": {
+      "schema": 1,
+      "mode": "ipc",
+      "load": "cpu",
+      "warmup_seconds": 12,
+      "query_interval_seconds": 0.5,
+      "queries_requested": 40,
+      "failures": 0,
+      "query_wall_ms": {
+        "count": 40,
+        "p50": 15.274033999958192,
+        "p95": 20.023043000037433,
+        "p99": 36.526082999955634
+      },
+      "reported_observation_age_seconds": {
+        "count": 40,
+        "p50": 0.475,
+        "p95": 0.924,
+        "p99": 0.993
+      },
+      "recording_wall_seconds": 20.73337596800002,
+      "recorder_cpu_seconds": 0.6,
+      "recorder_one_core_pct": 2.8938847244464316,
+      "sampled_peak_recorder_rss_bytes": 17752064
+    },
+    "ipc_churn": {
+      "schema": 1,
+      "mode": "ipc",
+      "load": "churn",
+      "warmup_seconds": 12,
+      "query_interval_seconds": 0.5,
+      "queries_requested": 40,
+      "failures": 0,
+      "query_wall_ms": {
+        "count": 40,
+        "p50": 26.564049000000978,
+        "p95": 36.54106699997328,
+        "p99": 50.73809300000676
+      },
+      "reported_observation_age_seconds": {
+        "count": 40,
+        "p50": 0.519,
+        "p95": 0.925,
+        "p99": 0.997
+      },
+      "recording_wall_seconds": 21.233813075,
+      "recorder_cpu_seconds": 0.96,
+      "recorder_one_core_pct": 4.521090944001352,
+      "sampled_peak_recorder_rss_bytes": 17641472
+    },
+    "ipc_idle_repeat": {
+      "schema": 1,
+      "mode": "ipc",
+      "load": "none",
+      "warmup_seconds": 12,
+      "query_interval_seconds": 0.5,
+      "queries_requested": 40,
+      "failures": 0,
+      "query_wall_ms": {
+        "count": 40,
+        "p50": 45.95507099998031,
+        "p95": 54.952084999968065,
+        "p99": 62.500100999955066
+      },
+      "reported_observation_age_seconds": {
+        "count": 40,
+        "p50": 0.47,
+        "p95": 0.923,
+        "p99": 0.978
+      },
+      "recording_wall_seconds": 21.94948146400003,
+      "recorder_cpu_seconds": 1.48,
+      "recorder_one_core_pct": 6.742756098486382,
+      "sampled_peak_recorder_rss_bytes": 13602816
+    }
+  },
+  "macos": {
+    "compiler": "AppleClang 21.0.0.21000334",
+    "synthetic_1000": {
+      "schema": 1,
+      "mode": "synthetic",
+      "samples": 360,
+      "query_repetitions": 20,
+      "entries_min": 1000,
+      "entries_max": 1000,
+      "generate_ms": {
+        "count": 360,
+        "p50": 0.002,
+        "p95": 0.002,
+        "p99": 0.003
+      },
+      "append_ms": {
+        "count": 360,
+        "p50": 0.079,
+        "p95": 0.106,
+        "p99": 0.12
+      },
+      "render_60s_ms": {
+        "count": 20,
+        "p50": 3.897,
+        "p95": 4.852,
+        "p99": 5.058
+      },
+      "recording_wall_seconds": 0.029974,
+      "recording_cpu_seconds": 0.029897,
+      "recording_one_core_pct": null,
+      "peak_rss_bytes": 40206336,
+      "retained_seconds": 37.0,
+      "retained_frames": 38,
+      "history_charged_bytes": 49750664,
+      "history_budget_bytes": 50331648,
+      "evicted_frames": 322,
+      "gaps": 0,
+      "partial_scans": 0,
+      "slow_scans": 0,
+      "skipped_entries": 0,
+      "denied_reads": 0,
+      "malformed_reads": 0,
+      "io_errors": 0,
+      "metadata_skipped": 0,
+      "system_cpu_seconds": 37.0,
+      "process_cpu_seconds": 37.0,
+      "signed_residual_seconds": -0.0,
+      "report_bytes": 1226
+    }
+  }
+}

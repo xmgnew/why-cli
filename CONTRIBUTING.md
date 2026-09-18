@@ -32,6 +32,15 @@ point fixtures at a live recorder.
 The CI matrix targets Linux GCC, Linux Clang, and macOS Clang. Distinguish a local
 successful test run from a hosted CI result that has not yet been observed.
 
+## Performance measurements
+
+Use the opt-in tools and Release build described in [docs/benchmarks.md](docs/benchmarks.md).
+Keep timing runs separate from sanitizer correctness checks. Record process count,
+workload, compiler/build flags, environment and sample counts alongside results.
+Do not infer real collection performance from accelerated synthetic history.
+Benchmark JSON should contain aggregate metrics only; keep local raw results under
+an ignored build directory. Timing percentiles are observations, not CI thresholds.
+
 ## Style and ownership
 
 Follow the LLVM-based `.clang-format`: indentation and tab width are four, with
@@ -48,7 +57,10 @@ explicit types, and clear error paths over unnecessary abstraction.
 
 Keep procfs I/O separate from CPU arithmetic, history ownership, and presentation.
 Document ownership in headers. Metadata is immutable and reference counted;
-history views are borrowed until the next append or eviction. Attribution results
+history views are borrowed until the next append or eviction. Append takes a
+caller-owned frame that must not alias retained history. History's metadata ledger
+counts its own references independently of the allocation's lifetime reference
+count; keep both correct on eviction and failed append. Attribution results
 own their row/index arrays but borrow process context: destroy the result before
 mutating or releasing its history. Release allocations on every error path, and
 do not change parser outputs when parsing fails.
